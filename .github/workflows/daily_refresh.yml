@@ -1,0 +1,14 @@
+name: Daily Streamlit Cache Refresh
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # chạy 0h UTC mỗi ngày (7h sáng VN)
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Streamlit refresh
+        run: |
+          curl -s "https://breakeven-ml.streamlit.app/?refresh=1"

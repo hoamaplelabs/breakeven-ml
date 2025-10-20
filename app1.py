@@ -1,4 +1,4 @@
-# app.py (Full English UI, Percentage Target, Login, and Base Only Scenario)
+# app.py — FINAL version (Daily Cache + Auto Refresh + GitHub Action compatible)
 
 import streamlit as st
 import pandas as pd
@@ -7,13 +7,11 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import warnings
 import os
-import io
+import pickle
+import datetime as dt
 
-# Suppress warnings for smooth execution
 warnings.filterwarnings('ignore')
 
-# Import core functions and BQ client from the refactored module
-# CHÚ Ý: Đảm bảo file renewal.py (hoặc renewal2.py) đã được đặt tên chính xác
 from renewal import (
     load_bigquery_renewal_data,
     get_renewal_forecast_data,
@@ -27,105 +25,181 @@ from renewal import (
     FORECAST_HORIZON_DAYS
 )
 
-# --- CONFIGURATION & CONSTANTS ---
-APP_ID_LIST = ['6736361418', '6503937276', '6738117098'] 
+# ==============================
+# CONFIGURATION
+# ==============================
+APP_ID_LIST = ['6736361418', '6503937276', '6738117098', 'ai.generated.art.photo']
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 BQ_CLIENT = client
 
-# --- STREAMLIT AUTHENTICATION LOGIC (RESTORED) ---
 
+# ==============================
+# DAILY CACHE HELPERS
+# ==============================
+def get_today_cache_path():
+    today_str = dt.date.today().strftime("%Y%m%d")
+    return os.path.join(CACHE_DIR, f"forecast_cache_{today_str}.pkl")
+
+def load_daily_cache():
+    path = get_today_cache_path()
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            # st.success(f"✅ Loaded cached forecast data for {dt.date.today().strftime('%Y-%m-%d')}")
+            return pickle.load(f)
+    return None
+
+def save_daily_cache(data):
+    path = get_today_cache_path()
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+    # st.success("💾 Daily cache saved successfully.")
+
+
+# ==============================
+# AUTO REFRESH TRIGGER (for GitHub Action or ?refresh=1)
+# ==============================
+query_params = st.query_params
+if query_params and "refresh" in query_params:
+    try:
+        os.remove(get_today_cache_path())
+        st.warning("♻️ Cache cleared by scheduler (auto-refresh triggered). Rebuilding now...")
+        st.stop()
+    except Exception:
+        pass
+
+
+# ==============================
+# CACHE LOADER (RUNS ONCE PER DAY)
+# ==============================
+@st.cache_resource(ttl=86400, show_spinner="⏳ Loading or building daily Prophet/Renewal cache...")
+def load_forecast_daily():
+    """Load cached forecasts or rebuild them once per day."""
+    cache = load_daily_cache()
+    if cache:
+        return cache
+
+    st.info("Running Prophet + Renewal models (first time today)...")
+
+    def load_all_daily_data(_bq_client, app_id_list):
+        app_ids_str = ", ".join([f"'{aid}'" for aid in app_id_list])
+        query = f"""
+            SELECT date, app_id, app_name, cost, revenue, (revenue - cost) AS profit
+            FROM `{BQ_DAILY_TABLE_PATH}`
+            WHERE app_id IN ({app_ids_str})
+        """
+        df = _bq_client.query(query).to_dataframe()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["app_id"] = df["app_id"].astype(str)
+        df = df.sort_values("date")
+        return df
+
+    df_all_daily = load_all_daily_data(BQ_CLIENT, APP_ID_LIST)
+
+    query_renewal = f"""
+        SELECT First_Date, App_Id, App_Name, Product_ID, Price_USD, Renew_Times,
+               Total_Renew, Cohort_Buy, Revenue_Renew, SubsStart_TrialConvert
+        FROM `{BQ_RENEWAL_TABLE_PATH}`
+    """
+    df_renewal_raw = load_bigquery_renewal_data(BQ_CLIENT, query_renewal)
+
+    forecast_dict = {}
+    for app_id in APP_ID_LIST:
+        # st.write(f"Building forecast for App ID: {app_id}")
+        df_prop = get_prophet_cost_forecast(
+            df_all_daily[df_all_daily["app_id"] == app_id][["date", "cost"]]
+        )
+        df_renewal = get_renewal_forecast_data(df_renewal_raw, app_id)
+        forecast_dict[app_id] = (df_prop, df_renewal)
+
+    data = {
+        "df_all_daily": df_all_daily,
+        "df_renewal_raw": df_renewal_raw,
+        "forecast_dict": forecast_dict,
+    }
+    save_daily_cache(data)
+    return data
+
+
+# ==============================
+# LOGIN (Optional)
+# ==============================
 def check_password():
-    """Returns True if the user enters the correct password (from st.secrets)."""
-    
     if st.session_state.get("password_correct", False):
         return True
 
+    # Load credentials
     if "credentials" not in st.secrets:
-        valid_users = {"admin": "admin_pass"} 
-        st.warning("⚠️ Using dummy credentials for local run. Configure 'secrets.toml' for deployment.")
+        valid_users = {"admin": "admin_pass"}
+        st.warning("⚠️ Dummy login (use secrets.toml for production).")
     else:
         credentials = st.secrets["credentials"]
         valid_users = {
-            credentials.get("username_admin"): credentials.get("password_admin"), 
+            credentials.get("username_admin"): credentials.get("password_admin"),
             credentials.get("username_viewer"): credentials.get("password_viewer"),
         }
         valid_users = {k: v for k, v in valid_users.items() if k and v}
-        if not valid_users:
-             st.error("Error: Login credentials in secrets.toml are empty.")
-             st.stop()
 
+    st.title("Login: Breakeven Optimization")
 
-    def authenticate_user():
-        username = st.session_state["username"]
-        password = st.session_state["password"]
-        
-        if username in valid_users and valid_users[username] == password: 
-            st.session_state["password_correct"] = True
-            st.session_state["username_logged"] = username
-            st.rerun()
-        else:
-            st.error("❌ Incorrect username or password.")
-
-    st.title("Login")
     with st.form("login_form"):
-        st.text_input("Username", key="username")
-        st.text_input("Password", type="password", key="password")
-        st.form_submit_button("Log in", on_click=authenticate_user)
-        
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in")
+
+    if submitted:
+        if username in valid_users and valid_users[username] == password:
+            st.session_state["password_correct"] = True
+            st.session_state["username"] = username
+            st.rerun()  # <- Bây giờ ở luồng chính, chạy OK
+        else:
+            st.error("❌ Wrong username or password")
+            return False
+
     return False
 
 
-# --- CACHED DATA LOADERS ---
+# ==============================
+# STREAMLIT CONFIG
+# ==============================
+st.set_page_config(layout="wide", page_title="Breakeven Dashboard", page_icon="💰")
 
-@st.cache_data(show_spinner="Loading Daily Data from BigQuery...")
-def load_all_daily_data(_bq_client, app_id_list):
-    """Loads daily data (Cost, Revenue) from BigQuery."""
-    
-    if _bq_client is None:
+if not check_password():
+    st.stop()
+
+st.title("Breakeven Optimization")
+
+# Chỉ hiện nút cho admin (khi bạn đã có check_password())
+is_admin = st.session_state.get("username") == "admin"  # tùy theo bạn lưu session
+if is_admin:
+    if st.sidebar.button("🔄 Force Refresh Now"):
         try:
-            # Fallback to local file for testing if BQ client fails
-            df_all = pd.read_csv("data/raw_data/daily_data.csv")
-            df_all['date'] = pd.to_datetime(df_all['date']).dt.date
-            df_all['app_id'] = df_all['App_ID'].astype(str)
-            df_all['revenue'] = df_all['Revenue']
-            df_all['cost'] = df_all['Cost']
-            df_all['app_name'] = df_all['App_Name']
-            df_all['profit'] = df_all['revenue'] - df_all['cost']
-            return df_all[df_all['app_id'].isin(app_id_list)].copy()
-        except:
-            st.error("Error: BigQuery client not initialized and local fallback failed.")
-            return pd.DataFrame()
-            
-    app_ids_str = ', '.join([f"'{aid}'" for aid in app_id_list])
-    query_daily = f"""
-        SELECT 
-            date, 
-            app_id, 
-            app_name, 
-            cost, 
-            revenue, 
-            (revenue - cost) AS profit
-        FROM `{BQ_DAILY_TABLE_PATH}` 
-        WHERE app_id IN ({app_ids_str})
-    """
-    
-    try:
-        df = _bq_client.query(query_daily).to_dataframe()
-        df['date'] = pd.to_datetime(df['date']).dt.date
-        df['app_id'] = df['app_id'].astype(str)
-        df = df.sort_values('date')
-        return df
-    
-    except Exception as e:
-        st.error(f"BIGQUERY QUERY EXECUTION ERROR (Daily Data): {e}. Could not load data.")
-        return pd.DataFrame()
+            os.remove(get_today_cache_path())
+        except FileNotFoundError:
+            pass
+        st.experimental_rerun()
+# Load cached data or rebuild
+data_cache = load_forecast_daily()
+df_all_daily = data_cache["df_all_daily"]
+df_renewal_raw = data_cache["df_renewal_raw"]
+forecast_dict = data_cache["forecast_dict"]
 
-@st.cache_data(ttl=3600, show_spinner="Processing App Data and Models...") 
+if df_all_daily.empty or df_renewal_raw.empty:
+    st.error("❌ No data available from BigQuery.")
+    st.stop()
+
+# st.success(f"✅ Data loaded from cache ({dt.date.today().strftime('%Y-%m-%d')})")
+# st.caption("Cached once daily for performance. Prophet + Renewal auto-refresh every 24h (via GitHub Action or ?refresh=1).")
+st.caption("Dashboard auto-refresh every 24h")
+
+# ==============================
+# RESTORE prepare_app_data()
+# ==============================
+@st.cache_data(ttl=3600, show_spinner="Processing App Data and Models...")
 def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     """
     Loads, filters, processes data, and runs Prophet/Renewal models for the selected app.
     """
-    
-    # 1. Filter Data
     df = df_all_data[df_all_data['app_id'] == selected_app_id].sort_values('date').reset_index(drop=True)
     if df.empty:
         raise ValueError("Historical data for selected app is empty.")
@@ -133,55 +207,31 @@ def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     df['roas'] = df.apply(
         lambda row: row['revenue'] / row['cost'] if row['cost'] > 0 else 0.0, axis=1
     )
-    
-    # 2. Calculate Key Variables
+
     df['cumulative_profit'] = df['profit'].cumsum() 
     current_loss = df['cumulative_profit'].iloc[-1]
     last_history_date = df['date'].iloc[-1]
     cost_hist_last = df['cost'].iloc[-1] 
-    
-    # 3. Calculate ROAS Baseline (7-Day Rolling)
+
     df_7_days = df.tail(7)
     roas_baseline = df_7_days['revenue'].sum() / df_7_days['cost'].sum() if df_7_days['cost'].sum() > 0 else 1.0
-    if np.isnan(roas_baseline) or np.isinf(roas_baseline): roas_baseline = 1.0
-    
+    if np.isnan(roas_baseline) or np.isinf(roas_baseline):
+        roas_baseline = 1.0
+
     roas_hist_last = df['roas'].iloc[-1] if not df['roas'].iloc[-1] < 0.01 else roas_baseline
     roas_hist_last = roas_hist_last if not np.isnan(roas_hist_last) else roas_baseline
 
-    # 4. Run Prophet & Renewal Models
     df_history_prophet_input = df[['date', 'cost']].copy() 
     df_renewal_f = get_renewal_forecast_data(df_renewal_raw, selected_app_id)
     df_propensity = get_prophet_cost_forecast(df_history_prophet_input) 
 
-    # 5. Default Cost
     default_cost_day_1 = df_propensity['cost_prophet_f'].iloc[0] if not df_propensity.empty and df_propensity['cost_prophet_f'].iloc[0] > 0 else 1000
 
-    return (df, current_loss, last_history_date, cost_hist_last, roas_hist_last, 
-            df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days)
+    return (
+        df, current_loss, last_history_date, cost_hist_last, roas_hist_last, 
+        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days
+    )
 
-
-# --- MAIN STREAMLIT APPLICATION ---
-
-if not check_password():
-    st.stop() 
-
-st.set_page_config(layout="wide", page_title="Breakeven", page_icon="💰")
-st.title("Breakeven Optimization Dashboard")
-
-# ----------------- DATA LOADING -----------------
-
-df_all_daily = load_all_daily_data(BQ_CLIENT, APP_ID_LIST)
-
-query_renewal = f"""
-    SELECT First_Date, App_Id, App_Name, Product_ID, Price_USD, Renew_Times, Total_Renew, Cohort_Buy, Revenue_Renew, SubsStart_TrialConvert
-    FROM `{BQ_RENEWAL_TABLE_PATH}` 
-"""
-df_renewal_raw = load_bigquery_renewal_data(BQ_CLIENT, query_renewal)
-
-
-if df_all_daily.empty or df_renewal_raw.empty:
-    st.error("Insufficient historical data from BigQuery to run the model.")
-    st.stop()
 
 # --- SIDEBAR: CONFIGURATION AND INPUTS (ENGLISH UI) ---
 

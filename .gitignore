@@ -10,3 +10,4 @@ assets/
 my_personal_ssh_key.pub
 my_personal_ssh_key
 .streamlit/secrets.toml
+cache/
