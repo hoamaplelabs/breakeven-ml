@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 # --- CONFIGURATION ---
 # Bỏ SERVICE_ACCOUNT_PATH vì dùng st.secrets
 BQ_RENEWAL_TABLE_PATH = 'applesearchads-305307.ab_testing.revenue_renew'
-BQ_DAILY_TABLE_PATH = 'applesearchads-305307.ab_testing.raw_data'
+BQ_DAILY_TABLE_PATH = 'applesearchads-305307.forecast.raw_data'
 
 # --- MODEL LOGIC CONFIGURATION ---
 RAMP_UP_DAYS = 14 
