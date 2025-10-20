@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import re
 from prophet import Prophet
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from scipy.optimize import brentq
 from sklearn.linear_model import LinearRegression
 import warnings
