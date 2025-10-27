@@ -70,13 +70,15 @@ def load_forecast_daily():
         query = f"""
             SELECT date, app_id, app_name, cost, revenue, (revenue - cost) AS profit
             FROM `{BQ_DAILY_TABLE_PATH}`
-            WHERE app_id IN ({app_ids_str}) and date <= date_sub(current_date(), interval 2 day)
+            WHERE app_id IN ({app_ids_str})
+            AND date <= DATE_SUB(CURRENT_DATE("Asia/Ho_Chi_Minh"), INTERVAL 2 DAY)
         """
         df = _bq_client.query(query).to_dataframe()
         df["date"] = pd.to_datetime(df["date"]).dt.date
         df["app_id"] = df["app_id"].astype(str)
         df = df.sort_values("date")
         return df
+
     df_all_daily = load_all_daily_data(BQ_CLIENT, APP_ID_LIST)
 
     query_renewal = f"""
