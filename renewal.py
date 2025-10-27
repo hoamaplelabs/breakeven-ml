@@ -21,7 +21,7 @@ BQ_RENEWAL_TABLE_PATH = 'applesearchads-305307.ab_testing.revenue_renew'
 BQ_DAILY_TABLE_PATH = 'applesearchads-305307.forecast.raw_data'
 
 # --- MODEL LOGIC CONFIGURATION ---
-RAMP_UP_DAYS = 14 
+# RAMP_UP_DAYS = 14 
 SMOOTHING_DAYS = 7 
 FORECAST_HORIZON_DAYS = 1000
 
@@ -39,11 +39,8 @@ except Exception as e:
     client = None
 
 # --- RENEWAL MODEL CLASS (Giữ nguyên) ---
+# --- RENEWAL MODEL CLASS ---
 class RenewalModel:
-    """
-    Sử dụng Decay Model dựa trên Cohort để dự báo Renewal Revenue (Base Revenue) 
-    trong tương lai cho một ứng dụng cụ thể.
-    """
     def __init__(self, df_renewal_raw, app_id):
         df_temp = df_renewal_raw[df_renewal_raw['App_Id'] == app_id].copy()
         self.df_raw = df_temp
@@ -292,7 +289,7 @@ class RenewalModel:
         
         return df_forecast.sort_values('date')
 
-# --- CACHED DATA LOADERS (Giữ nguyên) ---
+# --- CACHED DATA LOADERS ---
 
 @st.cache_data(show_spinner="Loading Renewal Data from BigQuery...")
 def load_bigquery_renewal_data(_bq_client, sql_query):
@@ -326,58 +323,61 @@ def get_renewal_forecast_data(df_renewal_raw, app_id):
         df_err.attrs['total_estimated_base_revenue'] = 0.0
         return df_err
 
-@st.cache_data(show_spinner="Running Cost Prophet Model...")
 def get_prophet_cost_forecast(df, max_days=FORECAST_HORIZON_DAYS):
-    
-    # BƯỚC 1: Xử lý df đầu vào và đổi tên cột an toàn
-    # df_cost là DataFrame ĐÃ được đổi tên, df là DataFrame GỐC
     df_cost = df.copy()
     if 'date' in df_cost.columns:
         df_cost = df_cost.rename(columns={'date': 'ds'})
     if 'cost' in df_cost.columns:
         df_cost = df_cost.rename(columns={'cost': 'y'})
         
-    df_cost = df_cost[['ds', 'y']] # Chỉ giữ lại 2 cột cần thiết
-    
-    # BƯỚC 2: Kiểm tra lỗi và xử lý
-    if df_cost.empty or 'ds' not in df_cost.columns or 'y' not in df_cost.columns:
-        # Trường hợp này không nên xảy ra nếu dữ liệu BigQuery đã tải đúng
-        st.error("Prophet Model: Dữ liệu lịch sử không hợp lệ (thiếu ds hoặc y).")
+    df_cost = df_cost[['ds', 'y']].dropna()
+    df_cost['y'] = pd.to_numeric(df_cost['y'], errors='coerce').fillna(method='ffill').clip(lower=0)
+
+    # Ensure datetime64 dtype
+    df_cost['ds'] = pd.to_datetime(df_cost['ds'])
+
+    if df_cost.empty:
+        st.error("Prophet Model: no valid historical data.")
         return pd.DataFrame()
 
-
-    df_cost['y'] = df_cost['y'].rolling(3, min_periods=1).mean().fillna(df_cost['y'])
-    
+    # Train Prophet
     m_cost = Prophet(yearly_seasonality=True, weekly_seasonality=True, changepoint_prior_scale=0.3)
     m_cost.fit(df_cost)
-    
+
+    # Predict
     future = m_cost.make_future_dataframe(periods=max_days)
     forecast_cost = m_cost.predict(future)
-    
-    # BƯỚC 3: FIX LỖI TRIỆT ĐỂ KeyERROR: 'ds'
-    # last_date_history phải được lấy từ df_cost (đã đổi tên)
-    last_date_history = df_cost['ds'].max() 
-    
     df_future = forecast_cost[['ds', 'yhat']].rename(columns={'yhat': 'cost_prophet_f'})
-    
-    # FIX LỖI TRIỆT ĐỂ TypeError: Invalid comparison
-    if isinstance(last_date_history, date) and not isinstance(last_date_history, datetime):
-        last_date_history = pd.to_datetime(last_date_history) 
-        
-    df_future = df_future[df_future['ds'] > last_date_history].reset_index(drop=True)
-    df_future['cost_prophet_f'] = np.maximum(0, df_future['cost_prophet_f'])
 
-    if df_future.empty or df_future['cost_prophet_f'].iloc[0] <= 0:
-        propensity_rate_base = 1.0
-    else:
-        propensity_rate_base = df_future['cost_prophet_f'].iloc[0]
-        
+    # ✅ Convert last history to Timestamp (fix your error)
+    last_hist = pd.to_datetime(df_cost['ds'].max())
+
+    # Filter only future dates (same dtype)
+    df_future = df_future[df_future['ds'] > last_hist].reset_index(drop=True)
+
+    # --- FIX LOGIC: avoid collapse to 0 ---
+    last_real = df_cost['y'].iloc[-1]
+    median_real = df_cost['y'].median()
+    min_floor = max(last_real * 0.7, median_real * 0.5, 10)  # 70% of last, or 50% of median, or ≥10$
+    df_future['cost_prophet_f'] = df_future['cost_prophet_f'].clip(lower=min_floor)
+
+    # Safety cap: if Prophet overshoots absurdly high
+    avg_hist = df_cost['y'].mean()
+    if df_future['cost_prophet_f'].mean() > avg_hist * 5:
+        scale_factor = (avg_hist * 5) / df_future['cost_prophet_f'].mean()
+        df_future['cost_prophet_f'] *= scale_factor
+
+    # Normalize rate for solver
+    propensity_rate_base = df_future['cost_prophet_f'].iloc[0]
     df_future['propensity_rate'] = df_future['cost_prophet_f'] / propensity_rate_base
     df_future['date'] = df_future['ds'].dt.date
-    
+
     return df_future
 
-# --- LOGIC TĂNG TRƯỞNG & LÀM MƯỢT (Giữ nguyên) ---
+
+# --- LOGIC TĂNG TRƯỞNG & LÀM MƯỢT ---
+# Đã bỏ RAMP_UP_DAYS cố định để cho phép thử nghiệm (giả định 14 ngày nếu không rõ)
+TEMP_RAMP_UP_DAYS = 7 
 
 def apply_cost_smoothing(df, cost_hist_last, smoothing_days=SMOOTHING_DAYS):
     df_out = df.copy()
@@ -392,7 +392,7 @@ def apply_cost_smoothing(df, cost_hist_last, smoothing_days=SMOOTHING_DAYS):
     
     return df_out.drop(columns=['smoothing_index']).copy()
 
-def apply_ramp_up(df, target_roas, roas_hist_last, ramp_up_days=RAMP_UP_DAYS):
+def apply_ramp_up(df, target_roas, roas_hist_last, ramp_up_days=TEMP_RAMP_UP_DAYS):
     df_out = df.copy()
     df_out['day_index'] = np.arange(1, len(df_out) + 1)
     ramp_factor = np.minimum(1.0, df_out['day_index'] / ramp_up_days)
@@ -405,7 +405,7 @@ def apply_ramp_up(df, target_roas, roas_hist_last, ramp_up_days=RAMP_UP_DAYS):
 def calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_profit, 
                                target_roas, initial_cost_day_1, recovery_threshold, 
                                cost_hist_last, roas_hist_last):
-    # Đã sửa: Sử dụng profit_f, cumulative_profit
+    
     df_temp = df_propensity.copy()
     
     df_temp['cost_f'] = initial_cost_day_1 * df_temp['propensity_rate']
@@ -427,7 +427,6 @@ def calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_
     if breakeven_row.empty:
         return df_temp, MAX_DAYS + 1, df_temp['cumulative_profit'].iloc[-1] if not df_temp.empty else current_cumulative_profit
     
-    # Đảm bảo df_temp có cột 'ds' (Prophet convention)
     if 'ds' not in df_temp.columns:
         df_temp['ds'] = pd.to_datetime(df_temp['date']) 
         
@@ -437,62 +436,33 @@ def calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_
 
 
 def calculate_cumulative_profit_base_only(df_propensity_history, df_renewal_f, current_loss, recovery_threshold):
-    """
-    Tính toán lợi nhuận tích lũy chỉ sử dụng Doanh thu Base (Renewal) và Cost = 0.
     
-    Args:
-        df_propensity_history (pd.DataFrame): DataFrame chứa cột 'ds' (datetime64[ns]) cho khung thời gian dự báo.
-        df_renewal_f (pd.DataFrame): DataFrame chứa dữ liệu gia hạn, bao gồm cột 'base_revenue_f' và cột ngày tháng ('ds' hoặc tương đương).
-        current_loss (float): Lợi nhuận tích lũy hiện tại (có thể âm).
-        recovery_threshold (float): Ngưỡng lợi nhuận tích lũy cần đạt.
-
-    Returns: 
-        tuple: (df_forecast, final_days)
-    """
-    
-    # 1. Khởi tạo DataFrame dự báo dựa trên timeline
     df_forecast = df_propensity_history[['ds']].copy()
     
-    # 2. Xử lý df_renewal_f: Đảm bảo cột ngày tháng là 'ds' và kiểu datetime64[ns]
-    
-    # --- Khắc phục lỗi KeyError: Đảm bảo tên cột là 'ds' ---
     if 'ds' not in df_renewal_f.columns:
-        # Nếu cột ngày tháng trong df_renewal_f không phải là 'ds', bạn cần đổi tên nó ở đây.
-        # Ví dụ: Giả sử cột ngày tháng là 'date'
         if 'date' in df_renewal_f.columns:
             df_renewal_f = df_renewal_f.rename(columns={'date': 'ds'})
         elif 'Date' in df_renewal_f.columns:
              df_renewal_f = df_renewal_f.rename(columns={'Date': 'ds'})
-        else:
-             # Nếu không tìm thấy cột ngày tháng nào, logic sẽ bị lỗi.
-             # Tốt nhất là đảm bảo hàm get_renewal_forecast_data đã chuẩn hóa.
-             pass 
-
-    # --- Khắc phục lỗi ValueError: Ép kiểu dữ liệu ---
-    # Chuyển đổi cột 'ds' trong df_renewal_f thành datetime để hợp nhất
+             
     df_renewal_f['ds'] = pd.to_datetime(df_renewal_f['ds'])
     
-    # 3. Hợp nhất với Doanh thu Base từ mô hình Renewal
     df_forecast = pd.merge(df_forecast, df_renewal_f[['ds', 'base_revenue_f']], on='ds', how='left')
     df_forecast['base_revenue_f'] = df_forecast['base_revenue_f'].fillna(0)
     
-    # 4. Tính toán các cột chính cho kịch bản Base Only
     df_forecast['cost_f'] = 0.0
-    df_forecast['acquisition_revenue_f'] = 0.0 # Không có người dùng mới
+    df_forecast['acquisition_revenue_f'] = 0.0 
     df_forecast['total_revenue_f'] = df_forecast['base_revenue_f']
     df_forecast['profit_f'] = df_forecast['total_revenue_f'] - df_forecast['cost_f']
 
-    # 5. Tính toán Lợi nhuận Tích lũy
     df_forecast['cumulative_profit'] = current_loss + df_forecast['profit_f'].cumsum()
     
-    # 6. Tìm ngày hòa vốn (nếu có)
     df_breakeven = df_forecast[df_forecast['cumulative_profit'] >= recovery_threshold]
     
-    final_days = FORECAST_HORIZON_DAYS + 1 # Mặc định là không hòa vốn
+    final_days = FORECAST_HORIZON_DAYS + 1 
 
     if not df_breakeven.empty:
         first_breakeven_ds = df_breakeven['ds'].iloc[0]
-        # Tính toán ngày cuối lịch sử (Giả định df_forecast bắt đầu ngay sau lịch sử)
         history_end_ds = df_forecast['ds'].iloc[0] - pd.Timedelta(days=1)
         
         final_days = (first_breakeven_ds - history_end_ds).days
@@ -505,15 +475,16 @@ def solve_breakeven_logic(df_propensity, df_renewal_f, current_cumulative_profit
     if df_propensity.empty:
         return pd.DataFrame(), fixed_roas, fixed_cost_day_1, 0, "Prophet model failed (Empty historical data)."
 
-    # Giữ nguyên logic tối ưu hóa (Brentq)
+    from scipy.optimize import brentq 
 
     if mode == 'Days':
+        # Mode Days: Tính toán Days dựa trên ROAS và Cost Cố định
         df_f, days, _ = calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_profit,
                                                     fixed_roas, fixed_cost_day_1, recovery_threshold, 
                                                     cost_hist_last, roas_hist_last)
         return df_f, fixed_roas, fixed_cost_day_1, days, None
     
-    from scipy.optimize import brentq 
+    # Modes ROAS hoặc Cost: Sử dụng Solver
 
     if mode == 'ROAS':
         target_days = int(target_value)
@@ -525,7 +496,7 @@ def solve_breakeven_logic(df_propensity, df_renewal_f, current_cumulative_profit
             return days - target_days
         
         a = 0.01  
-        b = 10.0  
+        b = 100.0 # Tăng giới hạn trên để linh hoạt hơn
         
         try:
             if func_roas(a) <= 0: 
@@ -533,7 +504,7 @@ def solve_breakeven_logic(df_propensity, df_renewal_f, current_cumulative_profit
                 return df_f_min, a, fixed_cost_day_1, target_days, "Minimum ROAS (0.01) is sufficient to breakeven faster than target days."
             if func_roas(b) > 0:
                 df_f_max, _, _ = calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_profit, b, fixed_cost_day_1, recovery_threshold, cost_hist_last, roas_hist_last)
-                return df_f_max, b, fixed_cost_day_1, target_days, "Cannot breakeven within target days (ROAS > 10.0 required)."
+                return df_f_max, b, fixed_cost_day_1, target_days, "Cannot breakeven within target days (ROAS > 100.0 required)."
 
             result_roas = brentq(func_roas, a, b, xtol=1e-3)
             df_f, days_check, _ = calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_profit,
@@ -544,7 +515,7 @@ def solve_breakeven_logic(df_propensity, df_renewal_f, current_cumulative_profit
 
         except ValueError:
             df_f_b, _, _ = calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_profit, b, fixed_cost_day_1, recovery_threshold, cost_hist_last, roas_hist_last)
-            return df_f_b, b, fixed_cost_day_1, target_days, "Solver failed. Cannot find ROAS within constraints [0.01, 10.0]."
+            return df_f_b, b, fixed_cost_day_1, target_days, "Solver failed. Cannot find ROAS within constraints [0.01, 100.0]."
 
     if mode == 'Cost':
         target_days = int(target_value)
@@ -555,7 +526,8 @@ def solve_breakeven_logic(df_propensity, df_renewal_f, current_cumulative_profit
                                                         cost_hist_last, roas_hist_last)
             return days - target_days
         
-        cost_range_max = df_propensity['cost_prophet_f'].iloc[0] * 10 if not df_propensity.empty and df_propensity['cost_prophet_f'].iloc[0] > 0 else 10000 
+        # Max Cost: Lấy Cost Prophet Day 1 x 100 lần để đảm bảo biên độ rộng
+        cost_range_max = df_propensity['cost_prophet_f'].iloc[0] * 100 if not df_propensity.empty and df_propensity['cost_prophet_f'].iloc[0] > 0 else 50000 
         
         a = 0.01
         b = cost_range_max
@@ -579,7 +551,7 @@ def solve_breakeven_logic(df_propensity, df_renewal_f, current_cumulative_profit
             df_f_b, _, _ = calculate_cumulative_profit(df_propensity, df_renewal_f, current_cumulative_profit, fixed_roas, b, recovery_threshold, cost_hist_last, roas_hist_last)
             return df_f_b, fixed_roas, b, target_days, "Solver failed. Cannot find Day 1 Cost within constraints."
 
-# --- EXPORT VARIABLES (For app.py to import) ---
+# --- EXPORT VARIABLES ---
 __all__ = [
     "load_bigquery_renewal_data",
     "get_renewal_forecast_data",

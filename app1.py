@@ -9,9 +9,7 @@ import warnings
 import os
 import pickle
 import datetime as dt
-
 warnings.filterwarnings('ignore')
-
 from renewal import (
     load_bigquery_renewal_data,
     get_renewal_forecast_data,
@@ -24,16 +22,11 @@ from renewal import (
     BQ_DAILY_TABLE_PATH, 
     FORECAST_HORIZON_DAYS
 )
-
-# ==============================
 # CONFIGURATION
-# ==============================
 APP_ID_LIST = ['6736361418', '6503937276', '6738117098', 'ai.generated.art.photo']
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 BQ_CLIENT = client
-
-
 # ==============================
 # DAILY CACHE HELPERS
 # ==============================
@@ -48,17 +41,12 @@ def load_daily_cache():
             # st.success(f"✅ Loaded cached forecast data for {dt.date.today().strftime('%Y-%m-%d')}")
             return pickle.load(f)
     return None
-
 def save_daily_cache(data):
     path = get_today_cache_path()
     with open(path, "wb") as f:
         pickle.dump(data, f)
     # st.success("💾 Daily cache saved successfully.")
-
-
-# ==============================
 # AUTO REFRESH TRIGGER (for GitHub Action or ?refresh=1)
-# ==============================
 query_params = st.query_params
 if query_params and "refresh" in query_params:
     try:
@@ -67,11 +55,7 @@ if query_params and "refresh" in query_params:
         st.stop()
     except Exception:
         pass
-
-
-# ==============================
 # CACHE LOADER (RUNS ONCE PER DAY)
-# ==============================
 @st.cache_resource(ttl=86400, show_spinner="⏳ Loading or building daily Prophet/Renewal cache...")
 def load_forecast_daily():
     """Load cached forecasts or rebuild them once per day."""
@@ -79,21 +63,20 @@ def load_forecast_daily():
     if cache:
         return cache
 
-    st.info("Running Prophet + Renewal models (first time today)...")
+    # st.info("Running Prophet + Renewal models (first time today)...")
 
     def load_all_daily_data(_bq_client, app_id_list):
         app_ids_str = ", ".join([f"'{aid}'" for aid in app_id_list])
         query = f"""
             SELECT date, app_id, app_name, cost, revenue, (revenue - cost) AS profit
             FROM `{BQ_DAILY_TABLE_PATH}`
-            WHERE app_id IN ({app_ids_str})
+            WHERE app_id IN ({app_ids_str}) and date <= date_sub(current_date(), interval 2 day)
         """
         df = _bq_client.query(query).to_dataframe()
         df["date"] = pd.to_datetime(df["date"]).dt.date
         df["app_id"] = df["app_id"].astype(str)
         df = df.sort_values("date")
         return df
-
     df_all_daily = load_all_daily_data(BQ_CLIENT, APP_ID_LIST)
 
     query_renewal = f"""
@@ -119,8 +102,6 @@ def load_forecast_daily():
     }
     save_daily_cache(data)
     return data
-
-
 # ==============================
 # LOGIN (Optional)
 # ==============================
@@ -136,6 +117,7 @@ def check_password():
         credentials = st.secrets["credentials"]
         valid_users = {
             credentials.get("username_admin"): credentials.get("password_admin"),
+            credentials.get("password_admin"): credentials.get("password_admin"),
             credentials.get("username_viewer"): credentials.get("password_viewer"),
         }
         valid_users = {k: v for k, v in valid_users.items() if k and v}
@@ -157,8 +139,6 @@ def check_password():
             return False
 
     return False
-
-
 # ==============================
 # STREAMLIT CONFIG
 # ==============================
@@ -166,7 +146,6 @@ st.set_page_config(layout="wide", page_title="Breakeven Dashboard", page_icon="�
 
 if not check_password():
     st.stop()
-
 st.title("Breakeven Optimization")
 
 # Chỉ hiện nút cho admin (khi bạn đã có check_password())
@@ -187,7 +166,6 @@ forecast_dict = data_cache["forecast_dict"]
 if df_all_daily.empty or df_renewal_raw.empty:
     st.error("❌ No data available from BigQuery.")
     st.stop()
-
 # st.success(f"✅ Data loaded from cache ({dt.date.today().strftime('%Y-%m-%d')})")
 # st.caption("Cached once daily for performance. Prophet + Renewal auto-refresh every 24h (via GitHub Action or ?refresh=1).")
 st.caption("Dashboard auto-refresh every 24h")
@@ -195,7 +173,7 @@ st.caption("Dashboard auto-refresh every 24h")
 # ==============================
 # RESTORE prepare_app_data()
 # ==============================
-@st.cache_data(ttl=3600, show_spinner="Processing App Data and Models...")
+@st.cache_data(ttl=86400, show_spinner="Processing App Data and Models...")
 def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     """
     Loads, filters, processes data, and runs Prophet/Renewal models for the selected app.
@@ -207,7 +185,6 @@ def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     df['roas'] = df.apply(
         lambda row: row['revenue'] / row['cost'] if row['cost'] > 0 else 0.0, axis=1
     )
-
     df['cumulative_profit'] = df['profit'].cumsum() 
     current_loss = df['cumulative_profit'].iloc[-1]
     last_history_date = df['date'].iloc[-1]
@@ -231,8 +208,6 @@ def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
         df, current_loss, last_history_date, cost_hist_last, roas_hist_last, 
         df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days
     )
-
-
 # --- SIDEBAR: CONFIGURATION AND INPUTS (ENGLISH UI) ---
 
 with st.sidebar:
@@ -298,36 +273,56 @@ with st.sidebar:
     # --- FIXED INPUTS ---
     st.markdown("##### Fixed Input Values")
 
+    def safe_float(x, default=0.0):
+        try:
+            v = float(x)
+            if np.isnan(v) or np.isinf(v):
+                return default
+            return v
+        except Exception:
+            return default
+
+    def safe_int(x, default=0):
+        try:
+            return int(float(x))
+        except Exception:
+            return default
+
+    # ----- DAYS: tất cả là int -----
     target_days_input = st.number_input(
         "Target Breakeven Days:",
-        min_value=1,
-        value=180,
-        step=30,
+        min_value=int(1),
+        value=int(180),
+        step=int(30),
         disabled=(selected_mode == 'Days'),
         help="Maximum or target days to achieve breakeven."
     )
 
     col_a, col_b = st.columns(2)
 
+    # ----- ROAS: tất cả là float -----
+    roas_val = max(safe_float(roas_baseline, 1.0), 0.1)
     target_roas_input = col_a.number_input(
         "Target ROAS:",
-        min_value=0.01,
-        value=max(roas_baseline, 0.1),
-        step=0.05, format="%.2f",
+        min_value=0.01,                 # float
+        value=float(roas_val),          # float
+        step=0.05,                      # float
+        format="%.2f",
         disabled=(selected_mode == 'ROAS'),
         help=f"7-Day Baseline ROAS: {roas_baseline:,.2f}"
     )
 
+    # ----- COST: tất cả là float -----
+    cost_default = max(safe_float(default_cost_day_1, 0.01), 0.01)
     target_cost_day_1_input = col_b.number_input(
         "Day 1 Cost Target ($):",
-        min_value=0.01,
-        value=default_cost_day_1,
-        step=100.0, format="%.2f",
+        min_value=0.01,                 # float
+        value=float(cost_default),      # float
+        step=100.0,                     # float
+        format="%.2f",
         disabled=(selected_mode == 'Cost'),
         help="Target Cost for the first day of the forecast period."
     )
-
-
 # ----------------- MAIN CONTENT: PERFORMANCE METRICS -----------------
 
 st.subheader(f"Strategy Dashboard for: **{selected_app_name}**")
@@ -394,7 +389,6 @@ else:
     except Exception as e:
         st.error(f"❌ ITERATIVE SOLVER ERROR (Optimized): {e}")
         is_error_case = True
-
 # -------------------- 2. RUN BASE ONLY (STOP SPEND) FORECAST --------------------
 
 base_only_data, base_only_days = calculate_cumulative_profit_base_only(
@@ -412,8 +406,6 @@ breakeven_ts = None
 breakeven_date = None
 base_only_breakeven_ts = None
 base_only_breakeven_date = None
-
-
 # Optimized Scenario Slicing
 if not is_error_case and final_days <= FORECAST_HORIZON_DAYS:
     breakeven_ts = history_end_ts + pd.to_timedelta(final_days, unit='D')
@@ -424,86 +416,84 @@ if not is_error_case and final_days <= FORECAST_HORIZON_DAYS:
                                 df_propensity['ds'].max()) # Max date from prophet timeline
     forecast_data_plot = forecast_data[forecast_data['ds'] <= optimized_plot_end_ts].copy()
     forecast_period_data = forecast_data[forecast_data['ds'] <= breakeven_ts].copy()
-    
 else:
     # Fallback plot data (show up to target_days + 30 or max horizon)
     max_plot_days_fallback = min(int(target_days_input if selected_mode != 'Days' else 180) + 30, FORECAST_HORIZON_DAYS) 
     forecast_data_plot = forecast_data.head(max_plot_days_fallback).copy()
     forecast_period_data = forecast_data_plot # Use this for summary if error
 
-
 # Base Only Scenario Slicing
 if base_only_days <= FORECAST_HORIZON_DAYS:
     base_only_breakeven_ts = history_end_ts + pd.to_timedelta(base_only_days, unit='D')
     base_only_breakeven_date = base_only_breakeven_ts.date()
-    
 # Determine the overall max plot date for BOTH scenarios
 # The plot should extend to the *later* of the two breakeven points (+ margin)
 # or the forecast horizon, whichever comes first.
-
 overall_max_plot_ds = df_propensity['ds'].max() # Default to max forecast horizon
 if breakeven_ts:
     overall_max_plot_ds = max(overall_max_plot_ds, breakeven_ts + pd.to_timedelta(30, unit='D'))
 if base_only_breakeven_ts:
     overall_max_plot_ds = max(overall_max_plot_ds, base_only_breakeven_ts + pd.to_timedelta(30, unit='D'))
-
 # Slice both forecast dataframes to this common end point
 forecast_data_plot = forecast_data[forecast_data['ds'] <= overall_max_plot_ds].copy()
 base_only_data_plot = base_only_data[base_only_data['ds'] <= overall_max_plot_ds].copy()
-
-
 # Standardize date column for Plotly
 forecast_data_plot['date'] = pd.to_datetime(forecast_data_plot['ds'])
 base_only_data_plot['date'] = pd.to_datetime(base_only_data_plot['ds'])
-
-
-# ----------------- 2. STRATEGY SUMMARY & RESULTS -----------------
-
+# ----------------- 2. STRATEGY SUMMARY & RESULTS (ĐÃ CẬP NHẬT) -----------------
 if not is_error_case and not forecast_period_data.empty:
     
-    avg_total_rev_forecast = forecast_period_data['total_revenue_f'].mean()
+    # Tính toán các chỉ số trung bình
+    avg_profit_forecast = forecast_period_data['profit_f'].mean()
     avg_cost_forecast = forecast_period_data['cost_f'].mean()
-    avg_profit_forecast = avg_total_rev_forecast - avg_cost_forecast
-    
-    # total_estimated_base_revenue = df_renewal_f.attrs.get('total_estimated_base_revenue', 0.0) # Ẩn đi
+    avg_base_rev_forecast = forecast_period_data['base_revenue_f'].mean()
+    avg_acq_rev_forecast = forecast_period_data['rev_from_cost_f'].mean()
+
+    total_estimated_base_revenue = df_renewal_f.attrs.get('total_estimated_base_revenue', 0.0)
 
     with st.container():
         st.markdown("#### Optimized Strategy Results vs. Stop Spend")
-        col_res_a, col_res_b, col_res_c = st.columns(3) # Đã giảm số cột
+        col_res_a, col_res_b, col_res_c = st.columns(3) 
 
-        # Display solved variable
-        if selected_mode == 'ROAS':
-            var_name = "Required ROAS"
-            var_value = f"{final_roas:,.2f}"
-        elif selected_mode == 'Cost':
-            var_name = "Required Day 1 Cost"
-            var_value = f"{final_cost:,.0f} $"
-        else:
-            var_name = "Days to Recovery (Optimized)"
-            var_value = f"{final_days} days"
+        # --- ĐIỀN KẾT QUẢ VÀO CÁC Ô TƯƠNG ỨNG ---
+
+        # 1. Variable Solved/Fixed (Days to Recovery)
+        days_text = f"{final_days} days"
+        days_delta = "Solved Result" if selected_mode == 'Days' else "Fixed Input"
+        col_res_a.metric("Days to Recovery (Optimized)", days_text, delta=days_delta)
         
-        # Optimized Breakeven/Recovery Day
-        opt_days_text = f"{final_days} days"
-        opt_delta = f"Est. Date: {breakeven_date.strftime('%Y-%m-%d')}" if breakeven_date else "Not Reached"
+        # 2. Variable Solved/Fixed (Target ROAS)
+        roas_text = f"{final_roas:,.2f}"
+        roas_delta = "Solved Result" if selected_mode == 'ROAS' else "Fixed Input"
+        col_res_b.metric("Target ROAS", roas_text, delta=roas_delta, delta_color='off')
         
-        # Base Only Breakeven/Recovery Day
+        # 3. Variable Solved/Fixed (Day 1 Cost)
+        cost_text = f"{final_cost:,.0f} $"
+        cost_delta = "Solved Result" if selected_mode == 'Cost' else "Fixed Input"
+        col_res_c.metric("Day 1 Cost Target", cost_text, delta=cost_delta, delta_color='off')
+        
+        
+    st.markdown("---")
+    
+    # HIỂN THỊ SO SÁNH BASE ONLY VÀ NET PROFIT
+    with st.container():
+        col_comp_a, col_comp_b, col_comp_c = st.columns(3)
+        
+        # Days to Recovery (Stop Spend)
         base_days_text = f"{base_only_days} days"
         base_delta = f"Est. Date: {base_only_breakeven_date.strftime('%Y-%m-%d')}" if base_only_breakeven_date else "Not Reached"
-
-        # Col A: Days to Recovery Comparison
-        col_res_a.metric("Days to Recovery (Optimized)", opt_days_text, delta=opt_delta)
-        col_res_b.metric("Days to Recovery (Stop Spend)", base_days_text, delta=base_delta, delta_color='off')
+        col_comp_a.metric("Days to Recovery (Stop Spend)", base_days_text, delta=base_delta, delta_color='off')
         
-        # Col C: Other Metrics
-        col_res_c.metric("Avg. Net Profit / Day (Optimized)", 
+        # Avg. Net Profit
+        col_comp_b.metric("Avg. Net Profit / Day (Optimized)", 
                          f"{avg_profit_forecast:,.2f} $",
                          help=f"Average Daily Net Profit (Base + Acquisition) during the {final_days} days.")
         
-        # Không hiển thị Total Base Revenue (LTV) ở đây nữa
-        # col_res_d.metric("Total Base Revenue (LTV)",
-        #                  f"{total_estimated_base_revenue:,.0f} $",
-        #                  help="Total estimated Renewal Revenue from existing cohorts until decay reduces to 1%.")
-        
+        # Base Revenue LTV
+        col_comp_c.metric("Total Estimated Base Revenue (LTV)",
+                         f"{total_estimated_base_revenue:,.2f} $",
+                         help="LTV estimate from existing cohorts until decay reduces to 1% retention.")
+
     st.markdown("---")
 
 elif is_error_case:
@@ -517,7 +507,6 @@ elif is_error_case:
         st.metric("Days to Recovery (Stop Spend)", base_days_text, delta=base_delta, delta_color='off')
         
     st.markdown("---")
-
 
 # ----------------- 3. VISUALIZATION TABS -----------------
 
@@ -549,7 +538,6 @@ with tab1:
     # Mở rộng đường Recovery đến cuối trục x của dữ liệu dự báo được vẽ
     fig.add_shape(type="line", x0=df_history_plot['date'].min(), y0=recovery_threshold, x1=overall_max_plot_ds, y1=recovery_threshold,
                   line=dict(color="Red", width=2, dash="dot"), name=f'Recovery Threshold ({recovery_target_percent}%)')
-
     # 5. Breakeven Markers
     if breakeven_ts:
         fig.add_trace(go.Scatter(x=[breakeven_ts], y=[recovery_threshold], mode='markers',
@@ -565,18 +553,13 @@ with tab1:
     fig.update_layout(title={'text': f'Cumulative Profit (Recovery Target: {recovery_target_percent}%)',
                              'x': 0.5, 'xanchor': 'center'},
                       xaxis_title="Date", yaxis_title="Cumulative Profit ($)", hovermode="x unified")
-
     st.plotly_chart(fig, use_container_width=True)
-
-
 # ------------------ TAB 2: DAILY COST & REVENUE CHART ------------------
-
 with tab2:
-    
     # Historical
     df_daily_hist = df[['date', 'cost', 'revenue']].copy()
     df_daily_hist = df_daily_hist.rename(columns={'revenue': 'total_revenue'})
-    
+
     # Forecast (Optimized)
     df_daily_forecast_opt = forecast_data_plot[['date', 'cost_f', 'total_revenue_f']].copy()
     df_daily_forecast_opt = df_daily_forecast_opt.rename(columns={'cost_f': 'cost_opt', 'total_revenue_f': 'total_revenue_opt'})
@@ -584,6 +567,16 @@ with tab2:
     # Forecast (Base Only)
     df_daily_forecast_base = base_only_data_plot[['date', 'cost_f', 'total_revenue_f']].copy()
     df_daily_forecast_base = df_daily_forecast_base.rename(columns={'cost_f': 'cost_base', 'total_revenue_f': 'total_revenue_base'})
+
+    # ✅ Fix dtype mismatch before comparison
+    last_actual_date = pd.to_datetime(df_daily_hist['date'].max())
+    df_daily_forecast_opt['date'] = pd.to_datetime(df_daily_forecast_opt['date'])
+    df_daily_forecast_base['date'] = pd.to_datetime(df_daily_forecast_base['date'])
+
+    # Filter forecast to show only after last actual date
+    df_daily_forecast_opt = df_daily_forecast_opt[df_daily_forecast_opt['date'] > last_actual_date]
+    df_daily_forecast_base = df_daily_forecast_base[df_daily_forecast_base['date'] > last_actual_date]
+
 
     # Combine Cost
     combined_cost = pd.concat([
@@ -598,12 +591,12 @@ with tab2:
         df_daily_forecast_opt[['date', 'total_revenue_opt']].set_index('date'),
         df_daily_forecast_base[['date', 'total_revenue_base']].set_index('date')
     ], axis=1).reset_index()
-    
-    # Fill NaN for historical parts in forecast columns 
-    combined_cost = combined_cost.fillna(value={'cost_opt': 0, 'cost_base': 0})
-    combined_rev = combined_rev.fillna(value={'total_revenue_opt': 0, 'total_revenue_base': 0})
 
+    # Fill missing values only where needed
+    combined_cost[['cost_opt', 'cost_base']] = combined_cost[['cost_opt', 'cost_base']].fillna(0)
+    combined_rev[['total_revenue_opt', 'total_revenue_base']] = combined_rev[['total_revenue_opt', 'total_revenue_base']].fillna(0)
 
+    # --- PLOT ---
     fig_cr = go.Figure()
 
     # 1) Historical
@@ -616,7 +609,7 @@ with tab2:
         mode='lines', name='Historical Revenue', line=dict(color='#3498DB', width=2)
     ))
 
-    # 2) Optimized Forecast 
+    # 2) Optimized Forecast
     fig_cr.add_trace(go.Scatter(
         x=combined_cost['date'], y=combined_cost['cost_opt'],
         mode='lines', name='Forecasted Cost (Optimized)', line=dict(color='#2ECC71', width=3, dash='dash')
@@ -626,14 +619,14 @@ with tab2:
         mode='lines', name='Forecasted Revenue (Optimized)', line=dict(color='#3498DB', width=3, dash='dash')
     ))
 
-    # 3) Base Only Forecast (Revenue = Base Only)
+    # 3) Base Only Forecast
     fig_cr.add_trace(go.Scatter(
         x=combined_rev['date'], y=combined_rev['total_revenue_base'],
         mode='lines', name='Revenue (Base Only)', line=dict(color='darkorange', width=3, dash='dot')
     ))
 
-
-    # "End of History" Line
+    # --- Vertical Lines ---
+    # End of History
     fig_cr.add_shape(
         type="line",
         x0=history_end_ts.to_pydatetime(), x1=history_end_ts.to_pydatetime(), y0=0, y1=1,
@@ -641,7 +634,7 @@ with tab2:
         line=dict(color="gray", width=2, dash="dot")
     )
 
-    # Breakeven Marker Line (Optimized)
+    # Optimized Breakeven
     if breakeven_ts:
         be_dt = breakeven_ts.to_pydatetime()
         fig_cr.add_shape(type="line", x0=be_dt, x1=be_dt, y0=0, y1=1, xref="x", yref="paper",
@@ -650,7 +643,7 @@ with tab2:
             text=f"Opt. Recovery ({breakeven_ts.strftime('%Y-%m-%d')})",
             showarrow=False, font=dict(size=12, color="blue"))
 
-    # Breakeven Marker Line (Base Only)
+    # Base-Only Breakeven
     if base_only_breakeven_ts:
         be_dt_base = base_only_breakeven_ts.to_pydatetime()
         fig_cr.add_shape(type="line", x0=be_dt_base, x1=be_dt_base, y0=0, y1=1, xref="x", yref="paper",
@@ -658,7 +651,6 @@ with tab2:
         fig_cr.add_annotation(x=be_dt_base, y=1.00, xref="x", yref="paper",
             text=f"Base Rec. ({base_only_breakeven_ts.strftime('%Y-%m-%d')})",
             showarrow=False, font=dict(size=12, color="green"))
-
 
     fig_cr.update_layout(
         title={'text': 'Daily Cost and Total Revenue: History and Forecast Comparison',
@@ -671,13 +663,9 @@ with tab2:
     st.plotly_chart(fig_cr, use_container_width=True)
 
 st.markdown("---")
-
-# ----------------- 4. DEEP DIVE (Detailed Summary Table) -----------------
-
+# Thay thế toàn bộ khối st.expander bằng code này
 with st.expander("Detailed Strategy Summary", expanded=False):
-    
     if not is_error_case and not forecast_period_data.empty:
-        
         summary_data = {
             'Metric': [
                 "History End Date", 
@@ -692,16 +680,17 @@ with st.expander("Detailed Strategy Summary", expanded=False):
                 "Recovery Profit Threshold",
                 "--- BASE ONLY SCENARIO ---", 
                 "Days to Recovery (Stop Spend)",
-                "--- FORECAST PERFORMANCE ---", 
-                "Avg. Net Profit / Day (Recovery Period - Optimized)",
+                "--- FORECAST PERFORMANCE (Recovery Period) ---", 
+                "Avg. Net Profit / Day",
+                "Avg. Acquisition Revenue / Day (from Cost)",
+                "Avg. Cost / Day",
                 "Avg. Base Revenue / Day (Renewal)", 
                 "Total Estimated Base Revenue (LTV)"
             ],
-            'Value':   [''] * 16, 
-            'Notes':   [''] * 16 
+            'Value':   [''] * 18, 
+            'Notes':   [''] * 18 
         }
         summary_df = pd.DataFrame(summary_data).set_index('Metric')
-
         # Gán giá trị
         summary_df.loc["History End Date", 'Value'] = last_history_date.strftime('%Y-%m-%d')
         summary_df.loc["Current Cumulative Profit", 'Value'] = f"{current_loss:,.2f} $"
@@ -709,36 +698,35 @@ with st.expander("Detailed Strategy Summary", expanded=False):
         summary_df.loc["Last History Day ROAS", 'Value'] = f"{roas_hist_last:,.2f}" 
         summary_df.loc["7-Day Rolling ROAS Baseline", 'Value'] = f"{roas_baseline:,.2f}"
         
+        # Gán giá trị đã giải/cố định
         summary_df.loc["Final ROAS (Solved/Fixed)", 'Value'] = f"{final_roas:,.2f}"
         summary_df.loc["Day 1 Cost (Solved/Fixed)", 'Value'] = f"{final_cost:,.2f} $"
         summary_df.loc["Days to Recovery (Optimized)", 'Value'] = f"{final_days}"
+        
         summary_df.loc["Recovery Profit Threshold", 'Value'] = f"{recovery_threshold:,.2f} $"
-        
         summary_df.loc["Days to Recovery (Stop Spend)", 'Value'] = f"{base_only_days}"
-
-        summary_df.loc["Avg. Net Profit / Day (Recovery Period - Optimized)", 'Value'] = f"{avg_profit_forecast:,.2f} $"
-        summary_df.loc["Avg. Base Revenue / Day (Renewal)", 'Value'] = f"{forecast_period_data['base_revenue_f'].mean():,.2f} $"
-        
-        # Total Estimated Base Revenue (LTV) vẫn hiển thị trong phần chi tiết này
-        total_estimated_base_revenue = df_renewal_f.attrs.get('total_estimated_base_revenue', 0.0)
+        # Gán các giá trị trung bình đã tính 
+        summary_df.loc["Avg. Net Profit / Day", 'Value'] = f"{avg_profit_forecast:,.2f} $"
+        summary_df.loc["Avg. Acquisition Revenue / Day (from Cost)", 'Value'] = f"{avg_acq_rev_forecast:,.2f} $"
+        summary_df.loc["Avg. Cost / Day", 'Value'] = f"{avg_cost_forecast:,.2f} $"
+        summary_df.loc["Avg. Base Revenue / Day (Renewal)", 'Value'] = f"{avg_base_rev_forecast:,.2f} $"
         summary_df.loc["Total Estimated Base Revenue (LTV)", 'Value'] = f"{total_estimated_base_revenue:,.2f} $"
-        
-        # Update Notes
+        # Cập nhật Notes
         summary_df.loc["Final ROAS (Solved/Fixed)", 'Notes'] = "Solved for this metric." if selected_mode == 'ROAS' else "Fixed input for calculation."
         summary_df.loc["Day 1 Cost (Solved/Fixed)", 'Notes'] = "Solved for this metric." if selected_mode == 'Cost' else "Fixed input for calculation."
         summary_df.loc["Days to Recovery (Optimized)", 'Notes'] = "Solved for this metric." if selected_mode == 'Days' else "Fixed input for calculation."
         summary_df.loc["Recovery Profit Threshold", 'Notes'] = f"Cumulative profit required to meet the {recovery_target_percent}% recovery target."
         summary_df.loc["Days to Recovery (Stop Spend)", 'Notes'] = "Time to reach threshold with Cost = 0 and Revenue = Base Only."
-
-        summary_df.loc["Avg. Net Profit / Day (Recovery Period - Optimized)", 'Notes'] = "Includes both Base (Renewal) and Acquisition Revenue."
+        
+        summary_df.loc["Avg. Net Profit / Day", 'Notes'] = "Net Profit = (Acq. Revenue - Cost) + Base Revenue."
+        summary_df.loc["Avg. Acquisition Revenue / Day (from Cost)", 'Notes'] = "Avg. daily revenue from new users, driven by cost."
+        summary_df.loc["Avg. Cost / Day", 'Notes'] = "Avg. daily ad spend during the recovery period."
+        summary_df.loc["Avg. Base Revenue / Day (Renewal)", 'Notes'] = "Avg. daily revenue from existing users renewing."
         summary_df.loc["Total Estimated Base Revenue (LTV)", 'Notes'] = "LTV estimate from existing cohorts until decay reduces to 1% retention."
-
         # Clear section headers
         for metric in summary_df.index:
             if "---" in metric:
                  summary_df.loc[metric, ['Value', 'Notes']] = ["", ""]
-        
         st.dataframe(summary_df, use_container_width=True)
-    
     else:
         st.warning("No detailed summary available due to solver error or failure to meet the recovery target.")
