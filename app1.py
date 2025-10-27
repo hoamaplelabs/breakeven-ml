@@ -106,25 +106,29 @@ def load_forecast_daily():
 # LOGIN (Optional)
 # ==============================
 def check_password():
+    """Secure login system compatible with Streamlit Cloud (no experimental_rerun)."""
+    # If already logged in, skip login form
     if st.session_state.get("password_correct", False):
         return True
 
     # Load credentials
     if "credentials" not in st.secrets:
+        # Fallback dummy credentials for local use
         valid_users = {"admin": "admin_pass"}
-        st.warning("⚠️ Dummy login (use secrets.toml for production).")
+        st.warning("⚠️ Using dummy login (set real credentials in .streamlit/secrets.toml).")
     else:
         credentials = st.secrets["credentials"]
         valid_users = {
             credentials.get("username_admin"): credentials.get("password_admin"),
-            credentials.get("password_admin"): credentials.get("password_admin"),
             credentials.get("username_viewer"): credentials.get("password_viewer"),
         }
+        # Remove empty or None keys
         valid_users = {k: v for k, v in valid_users.items() if k and v}
 
-    st.title("Login: Breakeven Optimization")
+    # Login UI
+    st.title("🔐 Login: Breakeven Optimization Dashboard")
 
-    with st.form("login_form"):
+    with st.form("login_form", clear_on_submit=False):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Log in")
@@ -133,12 +137,15 @@ def check_password():
         if username in valid_users and valid_users[username] == password:
             st.session_state["password_correct"] = True
             st.session_state["username"] = username
-            st.rerun()  # <- Bây giờ ở luồng chính, chạy OK
+            st.success(f"✅ Welcome, {username}! Please click 'Continue' below to open the dashboard.")
+            st.button("Continue")  # lightweight button for user-triggered rerun
+            st.stop()  # stop current script safely (Cloud-compatible)
         else:
-            st.error("❌ Wrong username or password")
+            st.error("❌ Wrong username or password.")
             return False
 
     return False
+
 # ==============================
 # STREAMLIT CONFIG
 # ==============================
