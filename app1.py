@@ -108,13 +108,12 @@ def load_forecast_daily():
 # LOGIN (Optional)
 # ==============================
 def check_password():
-    """Password check with Cloud-safe rerun (no experimental API)."""
+    """Password check with instant redirect after login (Cloud-safe)."""
     if st.session_state.get("password_correct", False):
         return True
 
     # Load credentials
     if "credentials" not in st.secrets:
-        # fallback dummy login
         valid_users = {"admin": "admin_pass"}
         st.warning("⚠️ Dummy login (use secrets.toml for production).")
     else:
@@ -123,7 +122,6 @@ def check_password():
             credentials.get("username_admin"): credentials.get("password_admin"),
             credentials.get("username_viewer"): credentials.get("password_viewer"),
         }
-        # Remove None / empty values
         valid_users = {k: v for k, v in valid_users.items() if k and v}
 
     st.title("Login: Breakeven Optimization")
@@ -137,17 +135,12 @@ def check_password():
         if username in valid_users and valid_users[username] == password:
             st.session_state["password_correct"] = True
             st.session_state["username"] = username
-
-            # ✅ Cách an toàn nhất trên Cloud: hiển thị nút reload nhẹ
-            st.success(f"✅ Welcome, {username}! Please refresh or click below to continue.")
-            st.button("Continue")  # user-triggered rerun
-            st.stop()  # stop safely instead of st.rerun()
+            st.rerun()  # ✅ vào ngay dashboard, không cần reload thủ công
         else:
             st.error("❌ Wrong username or password")
             return False
 
     return False
-
 
 # ==============================
 # STREAMLIT CONFIG
