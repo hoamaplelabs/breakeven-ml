@@ -161,9 +161,11 @@ if is_admin:
     if st.sidebar.button("🔄 Force Refresh Now"):
         try:
             os.remove(get_today_cache_path())
+            st.success("✅ Cache cleared. Please refresh the page manually.")
         except FileNotFoundError:
-            pass
-        st.experimental_rerun()
+            st.info("ℹ️ No cache file found to clear.")
+        st.stop()  # safer than rerun on Streamlit Cloud
+
 # Load cached data or rebuild
 data_cache = load_forecast_daily()
 df_all_daily = data_cache["df_all_daily"]
