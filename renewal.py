@@ -41,6 +41,7 @@ except Exception as e:
 
 # --- RENEWAL MODEL CLASS (Giữ nguyên) ---
 # --- RENEWAL MODEL CLASS ---
+# --- RENEWAL MODEL CLASS ---
 class RenewalModel:
     def __init__(self, df_renewal_raw, app_id):
         df_temp = df_renewal_raw[df_renewal_raw['App_Id'] == app_id].copy()
@@ -325,11 +326,6 @@ def get_renewal_forecast_data(df_renewal_raw, app_id):
         return df_err
 
 def get_prophet_cost_forecast(df, max_days=FORECAST_HORIZON_DAYS):
-    """
-    Hybrid cost forecast:
-    - Prophet for stable long-term data.
-    - Holt-Winters or EMA fallback when trend changes sharply.
-    """
     df_cost = df.copy()
     if 'date' in df_cost.columns:
         df_cost = df_cost.rename(columns={'date': 'ds'})
@@ -338,75 +334,46 @@ def get_prophet_cost_forecast(df, max_days=FORECAST_HORIZON_DAYS):
         
     df_cost = df_cost[['ds', 'y']].dropna()
     df_cost['y'] = pd.to_numeric(df_cost['y'], errors='coerce').fillna(method='ffill').clip(lower=0)
+
+    # Ensure datetime64 dtype
     df_cost['ds'] = pd.to_datetime(df_cost['ds'])
-    df_cost = df_cost.sort_values('ds')
 
     if df_cost.empty:
         st.error("Prophet Model: no valid historical data.")
         return pd.DataFrame()
 
-    # --- 1️⃣ PHASE DETECTION ---
-    last_30 = df_cost.tail(30)
-    model_choice = "prophet"
-    if len(last_30) >= 5:
-        pct_change_30 = (last_30['y'].iloc[-1] - last_30['y'].iloc[0]) / max(last_30['y'].iloc[0], 1)
-        weekly_var = last_30['y'].pct_change().std() * 100
-        # Nếu giảm mạnh >30% hoặc dao động >50% → đổi mô hình
-        if pct_change_30 < -0.3 or weekly_var > 50:
-            model_choice = "holtwinters"
+    # Train Prophet
+    m_cost = Prophet(yearly_seasonality=True, weekly_seasonality=True, changepoint_prior_scale=0.3)
+    m_cost.fit(df_cost)
 
-    # --- 2️⃣ TRAIN & FORECAST ---
-    if model_choice == "prophet":
-        try:
-            m_cost = Prophet(yearly_seasonality=True, weekly_seasonality=True, changepoint_prior_scale=0.3)
-            m_cost.fit(df_cost)
-            future = m_cost.make_future_dataframe(periods=max_days)
-            forecast_cost = m_cost.predict(future)
-            df_future = forecast_cost[['ds', 'yhat']].rename(columns={'yhat': 'cost_prophet_f'})
-        except Exception as e:
-            st.warning(f"Prophet failed ({e}), fallback to Holt-Winters.")
-            model_choice = "holtwinters"
+    # Predict
+    future = m_cost.make_future_dataframe(periods=max_days)
+    forecast_cost = m_cost.predict(future)
+    df_future = forecast_cost[['ds', 'yhat']].rename(columns={'yhat': 'cost_prophet_f'})
 
-    if model_choice == "holtwinters":
-        try:
-            df_hw = df_cost.copy().set_index('ds')
-            model_hw = ExponentialSmoothing(df_hw['y'], trend='add', seasonal='add', seasonal_periods=7)
-            fit_hw = model_hw.fit(optimized=True, use_brute=True)
-            forecast_values = fit_hw.forecast(max_days)
-            df_future = pd.DataFrame({
-                'ds': pd.date_range(start=df_hw.index[-1] + pd.Timedelta(days=1), periods=max_days),
-                'cost_prophet_f': forecast_values.values
-            })
-        except Exception as e:
-            st.warning(f"Holt-Winters failed ({e}), fallback to EMA.")
-            model_choice = "ema"
+    # ✅ Convert last history to Timestamp (fix your error)
+    last_hist = pd.to_datetime(df_cost['ds'].max())
 
-    if model_choice == "ema":
-        df_ema = df_cost.copy()
-        df_ema['ema'] = df_ema['y'].ewm(span=7, adjust=False).mean()
-        last_ema = df_ema['ema'].iloc[-1]
-        decay_rate = 0.97 if last_30['y'].iloc[-1] < last_30['y'].iloc[0] else 1.01
-        forecast_vals = [last_ema * (decay_rate ** i) for i in range(1, max_days + 1)]
-        df_future = pd.DataFrame({
-            'ds': pd.date_range(start=df_cost['ds'].iloc[-1] + pd.Timedelta(days=1), periods=max_days),
-            'cost_prophet_f': forecast_vals
-        })
+    # Filter only future dates (same dtype)
+    df_future = df_future[df_future['ds'] > last_hist].reset_index(drop=True)
 
-    # --- 3️⃣ POST-PROCESS ---
+    # --- FIX LOGIC: avoid collapse to 0 ---
     last_real = df_cost['y'].iloc[-1]
     median_real = df_cost['y'].median()
-    min_floor = max(last_real * 0.5, median_real * 0.5, 5)
+    min_floor = max(last_real * 0.7, median_real * 0.5, 10)  # 70% of last, or 50% of median, or ≥10$
     df_future['cost_prophet_f'] = df_future['cost_prophet_f'].clip(lower=min_floor)
 
+    # Safety cap: if Prophet overshoots absurdly high
     avg_hist = df_cost['y'].mean()
     if df_future['cost_prophet_f'].mean() > avg_hist * 5:
         scale_factor = (avg_hist * 5) / df_future['cost_prophet_f'].mean()
         df_future['cost_prophet_f'] *= scale_factor
 
-    df_future['propensity_rate'] = df_future['cost_prophet_f'] / max(df_future['cost_prophet_f'].iloc[0], 1)
+    # Normalize rate for solver
+    propensity_rate_base = df_future['cost_prophet_f'].iloc[0]
+    df_future['propensity_rate'] = df_future['cost_prophet_f'] / propensity_rate_base
     df_future['date'] = df_future['ds'].dt.date
 
-    st.caption(f"📈 Cost Forecast Model used: **{model_choice.upper()}**")
     return df_future
 
 

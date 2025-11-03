@@ -70,15 +70,13 @@ def load_forecast_daily():
         query = f"""
             SELECT date, app_id, app_name, cost, revenue, (revenue - cost) AS profit
             FROM `{BQ_DAILY_TABLE_PATH}`
-            WHERE app_id IN ({app_ids_str})
-            AND date <= DATE_SUB(CURRENT_DATE("Asia/Ho_Chi_Minh"), INTERVAL 2 DAY)
+            WHERE app_id IN ({app_ids_str}) and date <= date_sub(current_date(), interval 2 day)
         """
         df = _bq_client.query(query).to_dataframe()
         df["date"] = pd.to_datetime(df["date"]).dt.date
         df["app_id"] = df["app_id"].astype(str)
         df = df.sort_values("date")
         return df
-
     df_all_daily = load_all_daily_data(BQ_CLIENT, APP_ID_LIST)
 
     query_renewal = f"""
@@ -108,7 +106,6 @@ def load_forecast_daily():
 # LOGIN (Optional)
 # ==============================
 def check_password():
-    """Password check with instant redirect after login (Cloud-safe)."""
     if st.session_state.get("password_correct", False):
         return True
 
@@ -120,6 +117,7 @@ def check_password():
         credentials = st.secrets["credentials"]
         valid_users = {
             credentials.get("username_admin"): credentials.get("password_admin"),
+            credentials.get("password_admin"): credentials.get("password_admin"),
             credentials.get("username_viewer"): credentials.get("password_viewer"),
         }
         valid_users = {k: v for k, v in valid_users.items() if k and v}
@@ -135,13 +133,12 @@ def check_password():
         if username in valid_users and valid_users[username] == password:
             st.session_state["password_correct"] = True
             st.session_state["username"] = username
-            st.rerun()  # ✅ vào ngay dashboard, không cần reload thủ công
+            st.rerun()  # <- Bây giờ ở luồng chính, chạy OK
         else:
             st.error("❌ Wrong username or password")
             return False
 
     return False
-
 # ==============================
 # STREAMLIT CONFIG
 # ==============================
@@ -157,11 +154,9 @@ if is_admin:
     if st.sidebar.button("🔄 Force Refresh Now"):
         try:
             os.remove(get_today_cache_path())
-            st.success("✅ Cache cleared. Please refresh the page manually.")
         except FileNotFoundError:
-            st.info("ℹ️ No cache file found to clear.")
-        st.stop()  # safer than rerun on Streamlit Cloud
-
+            pass
+        st.experimental_rerun()
 # Load cached data or rebuild
 data_cache = load_forecast_daily()
 df_all_daily = data_cache["df_all_daily"]
