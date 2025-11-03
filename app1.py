@@ -385,26 +385,63 @@ else:
 
 # Nếu có bất thường 7 ngày (zero spend hoặc ROAS đột biến) → chỉ hiển thị base forecast
 # (Dùng cờ từ prepare_app_data)
-if not is_error_case and 'is_quality_issue' in locals() and is_quality_issue:
-    st.warning("⚠️ Detected zero spend or abnormal ROAS in last 7 days. Displaying Base Forecast (Renewal LTV) only.")
-    base_only_data, base_only_days = calculate_cumulative_profit_base_only(
-        df_propensity[['ds']].copy(), 
-        df_renewal_f, 
-        current_loss, 
-        0.0
+if is_quality_issue:
+    st.warning("⚠️ Detected zero spend or abnormal ROAS in last 7 days. Displaying Renewal Forecast (LTV) only.")
+    
+    renew_data, renew_days = calculate_cumulative_profit_base_only(
+        df_propensity[['ds']].copy(),
+        df_renewal_f,
+        current_loss,
+        recovery_threshold
     )
-    # Vẽ chart Base Only
-    fig_base = go.Figure()
-    fig_base.add_trace(go.Scatter(
-        x=base_only_data['ds'], y=base_only_data['cumulative_profit'],
-        mode='lines', name='Base Forecast (Renewal LTV)', line=dict(color='green', width=3)
+    
+    # Xác định ngày hoàn vốn nếu có
+    renew_breakeven_date = None
+    if not renew_data.empty:
+        reached = renew_data[renew_data['cumulative_profit'] >= recovery_threshold]
+        if not reached.empty:
+            renew_breakeven_date = pd.to_datetime(reached.iloc[0]['ds']).date()
+    
+    # --- Chart ---
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=renew_data['ds'], y=renew_data['cumulative_profit'],
+        mode='lines', name='Renew Forecast (LTV)', line=dict(color='green', width=3)
     ))
-    fig_base.update_layout(
-        title="Cumulative Profit (Base Forecast Only)",
-        xaxis_title="Date", yaxis_title="Cumulative Profit ($)",
+    
+    # Vẽ đường ngưỡng hoàn vốn
+    fig.add_shape(
+        type="line",
+        x0=renew_data['ds'].min(), x1=renew_data['ds'].max(),
+        y0=recovery_threshold, y1=recovery_threshold,
+        line=dict(color="red", width=2, dash="dot")
+    )
+    
+    # Đánh dấu ngày hoàn vốn nếu có
+    if renew_breakeven_date:
+        fig.add_trace(go.Scatter(
+            x=[renew_breakeven_date], y=[recovery_threshold],
+            mode='markers+text',
+            name=f"Recovery ({renew_breakeven_date})",
+            text=[renew_breakeven_date.strftime('%Y-%m-%d')],
+            textposition="top center",
+            marker=dict(size=10, color='red', symbol='star')
+        ))
+    
+    fig.update_layout(
+        title="Cumulative Profit (Renew Forecast Only)",
+        xaxis_title="Date",
+        yaxis_title="Cumulative Profit ($)",
         hovermode="x unified"
     )
-    st.plotly_chart(fig_base, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # --- Summary text ---
+    if renew_breakeven_date:
+        st.success(f"✅ Estimated recovery date (Renew Forecast): **{renew_breakeven_date.strftime('%Y-%m-%d')}**")
+    else:
+        st.info("ℹ️ No recovery reached within the forecast horizon (Renew Forecast).")
+    
     st.stop()
 
 # ----------------- SOLVER EXECUTION -----------------
