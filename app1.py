@@ -1,5 +1,3 @@
-# app.py — FINAL version (Daily Cache + Auto Refresh + GitHub Action compatible)
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,6 +8,7 @@ import os
 import pickle
 import datetime as dt
 warnings.filterwarnings('ignore')
+
 from renewal import (
     load_bigquery_renewal_data,
     get_renewal_forecast_data,
@@ -22,11 +21,14 @@ from renewal import (
     BQ_DAILY_TABLE_PATH, 
     FORECAST_HORIZON_DAYS
 )
+
 # CONFIGURATION
 APP_ID_LIST = ['6736361418', '6503937276', '6738117098', 'ai.generated.art.photo']
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 BQ_CLIENT = client
+
+
 # ==============================
 # DAILY CACHE HELPERS
 # ==============================
@@ -38,14 +40,15 @@ def load_daily_cache():
     path = get_today_cache_path()
     if os.path.exists(path):
         with open(path, "rb") as f:
-            # st.success(f"✅ Loaded cached forecast data for {dt.date.today().strftime('%Y-%m-%d')}")
             return pickle.load(f)
     return None
+
 def save_daily_cache(data):
     path = get_today_cache_path()
     with open(path, "wb") as f:
         pickle.dump(data, f)
-    # st.success("💾 Daily cache saved successfully.")
+
+
 # AUTO REFRESH TRIGGER (for GitHub Action or ?refresh=1)
 query_params = st.query_params
 if query_params and "refresh" in query_params:
@@ -55,15 +58,16 @@ if query_params and "refresh" in query_params:
         st.stop()
     except Exception:
         pass
-# CACHE LOADER (RUNS ONCE PER DAY)
+
+
+# ==============================
+# LOAD FORECAST DAILY
+# ==============================
 @st.cache_resource(ttl=86400, show_spinner="⏳ Loading or building daily Prophet/Renewal cache...")
 def load_forecast_daily():
-    """Load cached forecasts or rebuild them once per day."""
     cache = load_daily_cache()
     if cache:
         return cache
-
-    # st.info("Running Prophet + Renewal models (first time today)...")
 
     def load_all_daily_data(_bq_client, app_id_list):
         app_ids_str = ", ".join([f"'{aid}'" for aid in app_id_list])
@@ -77,6 +81,7 @@ def load_forecast_daily():
         df["app_id"] = df["app_id"].astype(str)
         df = df.sort_values("date")
         return df
+
     df_all_daily = load_all_daily_data(BQ_CLIENT, APP_ID_LIST)
 
     query_renewal = f"""
@@ -88,7 +93,6 @@ def load_forecast_daily():
 
     forecast_dict = {}
     for app_id in APP_ID_LIST:
-        # st.write(f"Building forecast for App ID: {app_id}")
         df_prop = get_prophet_cost_forecast(
             df_all_daily[df_all_daily["app_id"] == app_id][["date", "cost"]]
         )
@@ -102,14 +106,15 @@ def load_forecast_daily():
     }
     save_daily_cache(data)
     return data
+
+
 # ==============================
-# LOGIN (Optional)
+# LOGIN
 # ==============================
 def check_password():
     if st.session_state.get("password_correct", False):
         return True
 
-    # Load credentials
     if "credentials" not in st.secrets:
         valid_users = {"admin": "admin_pass"}
         st.warning("⚠️ Dummy login (use secrets.toml for production).")
@@ -133,12 +138,13 @@ def check_password():
         if username in valid_users and valid_users[username] == password:
             st.session_state["password_correct"] = True
             st.session_state["username"] = username
-            st.rerun()  # <- Bây giờ ở luồng chính, chạy OK
+            st.rerun()
         else:
             st.error("❌ Wrong username or password")
             return False
-
     return False
+
+
 # ==============================
 # STREAMLIT CONFIG
 # ==============================
@@ -146,10 +152,11 @@ st.set_page_config(layout="wide", page_title="Breakeven Dashboard", page_icon="�
 
 if not check_password():
     st.stop()
+
 st.title("Breakeven Optimization")
 
-# Chỉ hiện nút cho admin (khi bạn đã có check_password())
-is_admin = st.session_state.get("username") == "admin"  # tùy theo bạn lưu session
+# Admin tools
+is_admin = st.session_state.get("username") == "admin"
 if is_admin:
     if st.sidebar.button("🔄 Force Refresh Now"):
         try:
@@ -157,7 +164,10 @@ if is_admin:
         except FileNotFoundError:
             pass
         st.experimental_rerun()
-# Load cached data or rebuild
+
+# ==============================
+# LOAD CACHED DATA
+# ==============================
 data_cache = load_forecast_daily()
 df_all_daily = data_cache["df_all_daily"]
 df_renewal_raw = data_cache["df_renewal_raw"]
@@ -166,66 +176,65 @@ forecast_dict = data_cache["forecast_dict"]
 if df_all_daily.empty or df_renewal_raw.empty:
     st.error("❌ No data available from BigQuery.")
     st.stop()
-# st.success(f"✅ Data loaded from cache ({dt.date.today().strftime('%Y-%m-%d')})")
-# st.caption("Cached once daily for performance. Prophet + Renewal auto-refresh every 24h (via GitHub Action or ?refresh=1).")
+
 st.caption("Dashboard auto-refresh every 24h")
 
+# ==============================
+# PREPARE APP DATA
+# ==============================
 @st.cache_data(ttl=86400, show_spinner="Processing App Data and Models...")
 def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     """
     Loads, filters, processes data, and runs Prophet/Renewal models for the selected app.
-    Detects abnormal zero-spend patterns to disable forecast when needed.
+    Added quality checks for zero spend & abnormal ROAS.
     """
     df = df_all_data[df_all_data['app_id'] == selected_app_id].sort_values('date').reset_index(drop=True)
     if df.empty:
         raise ValueError("Historical data for selected app is empty.")
 
-    df['roas'] = df.apply(
-        lambda row: row['revenue'] / row['cost'] if row['cost'] > 0 else 0.0, axis=1
-    )
+    df['roas'] = df.apply(lambda row: row['revenue'] / row['cost'] if row['cost'] > 0 else 0.0, axis=1)
     df['cumulative_profit'] = df['profit'].cumsum() 
     current_loss = df['cumulative_profit'].iloc[-1]
     last_history_date = df['date'].iloc[-1]
     cost_hist_last = df['cost'].iloc[-1] 
 
-    # --- 7-Day Rolling ---
+    # 7-day rolling baseline
     df_7_days = df.tail(7)
     roas_baseline = df_7_days['revenue'].sum() / df_7_days['cost'].sum() if df_7_days['cost'].sum() > 0 else 1.0
     if np.isnan(roas_baseline) or np.isinf(roas_baseline):
         roas_baseline = 1.0
 
+    # --- QUALITY CHECK LOGIC ---
+    zero_spend_days = (df_7_days['cost'] <= 0).sum()
+    df_last_30 = df.tail(30)
+    roas_last_30 = df_last_30.apply(lambda r: r['revenue'] / r['cost'] if r['cost'] > 0 else np.nan, axis=1).dropna()
+    roas_median_30 = roas_last_30.median() if not roas_last_30.empty else 1.0
+    roas_abnormal = roas_baseline > (3 * roas_median_30)
+    is_quality_issue = (zero_spend_days > 0) or roas_abnormal
+
+    # (Thông tin tham khảo thêm cho UI/metric 7 ngày)
+    df_7_days = df_7_days[df_7_days['cost'] > 0]  # remove zero spend days from last-7 calc view
+
     roas_hist_last = df['roas'].iloc[-1] if not df['roas'].iloc[-1] < 0.01 else roas_baseline
     roas_hist_last = roas_hist_last if not np.isnan(roas_hist_last) else roas_baseline
 
-    # --- Detect abnormal zero-spend pattern ---
-    zero_spend_days = (df_7_days['cost'] <= 0).sum()
-    disable_forecast = zero_spend_days > 2
-    if disable_forecast:
-        st.warning(f"⚠️ Detected {zero_spend_days} zero-spend days in last 7 days — disabling acquisition forecast.")
+    # 🔒 Prophet input: remove zero spend days before training
+    df_history_prophet_input = df[df['cost'] > 0][['date', 'cost']].copy()
 
-    # --- Prepare forecast models ---
-    df_history_prophet_input = df[['date', 'cost']].copy() 
     df_renewal_f = get_renewal_forecast_data(df_renewal_raw, selected_app_id)
+    df_propensity = get_prophet_cost_forecast(df_history_prophet_input) 
 
-    # Prophet cost forecast
-    df_propensity = pd.DataFrame()
-    if not disable_forecast:
-        df_propensity = get_prophet_cost_forecast(df_history_prophet_input) 
-
-    # Default Day 1 Cost
-    default_cost_day_1 = (
-        df_propensity['cost_prophet_f'].iloc[0]
-        if not df_propensity.empty and df_propensity['cost_prophet_f'].iloc[0] > 0
-        else 1000
-    )
+    default_cost_day_1 = df_propensity['cost_prophet_f'].iloc[0] if not df_propensity.empty and df_propensity['cost_prophet_f'].iloc[0] > 0 else 1000
 
     return (
-        df, current_loss, last_history_date, cost_hist_last, roas_hist_last,
-        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days, disable_forecast
+        df, current_loss, last_history_date, cost_hist_last, roas_hist_last, 
+        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days, is_quality_issue
     )
 
-# --- SIDEBAR: CONFIGURATION AND INPUTS (ENGLISH UI) ---
 
+# ==============================
+# SIDEBAR SETTINGS
+# ==============================
 with st.sidebar:
     st.header("🛠️ Settings")
 
@@ -243,9 +252,8 @@ with st.sidebar:
 
     try:
         (df, current_loss, last_history_date, cost_hist_last, roas_hist_last, 
-        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days, disable_forecast) = \
+        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days, is_quality_issue) = \
             prepare_app_data(df_all_daily, df_renewal_raw, selected_app_id)
-
     except ValueError as e:
         st.error(f"Data Preparation Error: {str(e)}")
         st.stop()
@@ -340,6 +348,7 @@ with st.sidebar:
         disabled=(selected_mode == 'Cost'),
         help="Target Cost for the first day of the forecast period."
     )
+
 # ----------------- MAIN CONTENT: PERFORMANCE METRICS -----------------
 
 st.subheader(f"Strategy Dashboard for: **{selected_app_name}**")
@@ -350,39 +359,65 @@ with st.container():
     st.markdown("#### Current Performance Snapshot (7-Day Rolling)")
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 
-    # 7-Day Rolling Metrics
-    avg_cost_7 = df_7_days['cost'].mean()
-    avg_rev_7 = df_7_days['revenue'].mean()
-    avg_roas_7 = roas_baseline 
+    # 7-Day Rolling Metrics (chỉ tính trên df_7_days đã loại zero spend ở phần prepare)
+    avg_cost_7 = df_7_days['cost'].mean() if not df_7_days.empty else 0.0
+    avg_rev_7 = df_7_days['revenue'].mean() if not df_7_days.empty else 0.0
+    avg_roas_7 = (df_7_days['revenue'].sum() / df_7_days['cost'].sum()) if not df_7_days.empty and df_7_days['cost'].sum() > 0 else roas_baseline
 
     col_m1.metric("Current Cumulative Profit", f"{current_loss:,.2f} $",
                   delta=f"Data up to {last_history_date.strftime('%Y-%m-%d')}", delta_color="inverse")
-    col_m2.metric("7-Day Avg. Cost", f"{avg_cost_7:,.2f} $", help="Average daily Cost over the last 7 days.")
-    col_m3.metric("7-Day Avg. Revenue", f"{avg_rev_7:,.2f} $", help="Average daily Revenue over the last 7 days.")
-    col_m4.metric("7-Day Rolling ROAS", f"{avg_roas_7:,.2f}", help="Revenue / Cost over the last 7 days.")
+    col_m2.metric("7-Day Avg. Cost", f"{avg_cost_7:,.2f} $", help="Average daily Cost over the last 7 days (non-zero spend days).")
+    col_m3.metric("7-Day Avg. Revenue", f"{avg_rev_7:,.2f} $", help="Average daily Revenue over the last 7 days (non-zero spend days).")
+    col_m4.metric("7-Day Rolling ROAS", f"{avg_roas_7:,.2f}", help="Revenue / Cost over the last 7 days (non-zero spend days).")
 
 st.markdown("---")
 
+# ==============================
+# MAIN EXECUTION (QUALITY GATE)
+# ==============================
+if df_propensity.empty:
+    st.error("Error: Cost Prophet model failed. Calculation stopped.")
+    is_error_case = True
+    error_msg = "Prophet model failed (Empty or invalid historical data)."
+else:
+    is_error_case = False
+    error_msg = None
+
+# Nếu có bất thường 7 ngày (zero spend hoặc ROAS đột biến) → chỉ hiển thị base forecast
+# (Dùng cờ từ prepare_app_data)
+if not is_error_case and 'is_quality_issue' in locals() and is_quality_issue:
+    st.warning("⚠️ Detected zero spend or abnormal ROAS in last 7 days. Displaying Base Forecast (Renewal LTV) only.")
+    base_only_data, base_only_days = calculate_cumulative_profit_base_only(
+        df_propensity[['ds']].copy(), 
+        df_renewal_f, 
+        current_loss, 
+        0.0
+    )
+    # Vẽ chart Base Only
+    fig_base = go.Figure()
+    fig_base.add_trace(go.Scatter(
+        x=base_only_data['ds'], y=base_only_data['cumulative_profit'],
+        mode='lines', name='Base Forecast (Renewal LTV)', line=dict(color='green', width=3)
+    ))
+    fig_base.update_layout(
+        title="Cumulative Profit (Base Forecast Only)",
+        xaxis_title="Date", yaxis_title="Cumulative Profit ($)",
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig_base, use_container_width=True)
+    st.stop()
+
 # ----------------- SOLVER EXECUTION -----------------
-is_error_case = False
-error_msg = None
+is_error_case = False if not is_error_case else True
 final_roas = target_roas_input
 final_cost = target_cost_day_1_input
 final_days = target_days_input
 forecast_data = pd.DataFrame()
 forecast_period_data = pd.DataFrame()
+error_msg = None
 
 # -------------------- 1. RUN OPTIMIZED FORECAST --------------------
-if disable_forecast:
-    st.info("📉 Forecast disabled due to irregular spending pattern (too many zero-cost days). Showing only renewal baseline (Stop Spend).")
-    forecast_data = pd.DataFrame()
-    is_error_case = True
-    error_msg = "Forecast disabled due to zero-cost days."
-
-if df_propensity.empty:
-    st.error("Error: Cost Prophet model failed. Calculation stopped.")
-    is_error_case = True
-else:
+if not is_error_case:
     try:
         if selected_mode == 'ROAS':
             forecast_data, solved_roas, final_cost, final_days, error_msg = solve_breakeven_logic(
@@ -411,8 +446,9 @@ else:
     except Exception as e:
         st.error(f"❌ ITERATIVE SOLVER ERROR (Optimized): {e}")
         is_error_case = True
-# -------------------- 2. RUN BASE ONLY (STOP SPEND) FORECAST --------------------
+        error_msg = str(e)
 
+# -------------------- 2. RUN BASE ONLY (STOP SPEND) FORECAST --------------------
 base_only_data, base_only_days = calculate_cumulative_profit_base_only(
     df_propensity[['ds']].copy(), 
     df_renewal_f, 
@@ -422,20 +458,20 @@ base_only_data, base_only_days = calculate_cumulative_profit_base_only(
 base_only_data_plot = base_only_data.copy()
 
 # ----------------- BREAKEVEN DATE + DATA SLICING -----------------
-
 history_end_ts = pd.to_datetime(df['date'].iloc[-1])
 breakeven_ts = None
 breakeven_date = None
 base_only_breakeven_ts = None
 base_only_breakeven_date = None
+
 # Optimized Scenario Slicing
-if not is_error_case and final_days <= FORECAST_HORIZON_DAYS:
+if not is_error_case and not forecast_data.empty and final_days <= FORECAST_HORIZON_DAYS:
     breakeven_ts = history_end_ts + pd.to_timedelta(final_days, unit='D')
     breakeven_date = breakeven_ts.date() 
     
     # Plot up to the optimized breakeven date + 30 days, or max horizon
     optimized_plot_end_ts = min(breakeven_ts + pd.to_timedelta(30, unit='D'), 
-                                df_propensity['ds'].max()) # Max date from prophet timeline
+                                pd.to_datetime(df_propensity['ds'].max())) # Max date from prophet timeline
     forecast_data_plot = forecast_data[forecast_data['ds'] <= optimized_plot_end_ts].copy()
     forecast_period_data = forecast_data[forecast_data['ds'] <= breakeven_ts].copy()
 else:
@@ -448,20 +484,22 @@ else:
 if base_only_days <= FORECAST_HORIZON_DAYS:
     base_only_breakeven_ts = history_end_ts + pd.to_timedelta(base_only_days, unit='D')
     base_only_breakeven_date = base_only_breakeven_ts.date()
+
 # Determine the overall max plot date for BOTH scenarios
-# The plot should extend to the *later* of the two breakeven points (+ margin)
-# or the forecast horizon, whichever comes first.
-overall_max_plot_ds = df_propensity['ds'].max() # Default to max forecast horizon
-if breakeven_ts:
+overall_max_plot_ds = pd.to_datetime(df_propensity['ds'].max()) # Default to max forecast horizon
+if breakeven_ts is not None:
     overall_max_plot_ds = max(overall_max_plot_ds, breakeven_ts + pd.to_timedelta(30, unit='D'))
-if base_only_breakeven_ts:
+if base_only_breakeven_ts is not None:
     overall_max_plot_ds = max(overall_max_plot_ds, base_only_breakeven_ts + pd.to_timedelta(30, unit='D'))
+
 # Slice both forecast dataframes to this common end point
-forecast_data_plot = forecast_data[forecast_data['ds'] <= overall_max_plot_ds].copy()
-base_only_data_plot = base_only_data[base_only_data['ds'] <= overall_max_plot_ds].copy()
+forecast_data_plot = forecast_data_plot[forecast_data_plot['ds'] <= overall_max_plot_ds].copy()
+base_only_data_plot = base_only_data_plot[base_only_data_plot['ds'] <= overall_max_plot_ds].copy()
+
 # Standardize date column for Plotly
 forecast_data_plot['date'] = pd.to_datetime(forecast_data_plot['ds'])
 base_only_data_plot['date'] = pd.to_datetime(base_only_data_plot['ds'])
+
 # ----------------- 2. STRATEGY SUMMARY & RESULTS (ĐÃ CẬP NHẬT) -----------------
 if not is_error_case and not forecast_period_data.empty:
     
@@ -476,8 +514,6 @@ if not is_error_case and not forecast_period_data.empty:
     with st.container():
         st.markdown("#### Optimized Strategy Results vs. Stop Spend")
         col_res_a, col_res_b, col_res_c = st.columns(3) 
-
-        # --- ĐIỀN KẾT QUẢ VÀO CÁC Ô TƯƠNG ỨNG ---
 
         # 1. Variable Solved/Fixed (Days to Recovery)
         days_text = f"{final_days} days"
@@ -519,7 +555,7 @@ if not is_error_case and not forecast_period_data.empty:
     st.markdown("---")
 
 elif is_error_case:
-    st.error(f"❌ Conclusion (Optimized Scenario): {error_msg}")
+    st.error(f"❌ Conclusion (Optimized Scenario): {error_msg if error_msg else 'Unknown error'}")
     
     # Still show Base Only comparison
     with st.container():
@@ -547,26 +583,27 @@ with tab1:
                              name='Historical Cumulative Profit', line=dict(color='#ff7f0e', width=3)))
     
     # 2. Optimized Forecast
-    fig.add_trace(go.Scatter(x=forecast_data_plot['date'], y=forecast_data_plot['cumulative_profit'], mode='lines',
-                             name=f'Forecast (Opt. ROAS {final_roas:,.2f}, Cost {final_cost:,.0f} $)', 
-                             line=dict(color='#1f77b4', width=3, dash='dash')))
+    if not forecast_data_plot.empty:
+        fig.add_trace(go.Scatter(x=forecast_data_plot['date'], y=forecast_data_plot['cumulative_profit'], mode='lines',
+                                 name=f'Forecast (Opt. ROAS {final_roas:,.2f}, Cost {final_cost:,.0f} $)', 
+                                 line=dict(color='#1f77b4', width=3, dash='dash')))
 
     # 3. Base Only (Stop Spend) Forecast
-    fig.add_trace(go.Scatter(x=base_only_data_plot['date'], y=base_only_data_plot['cumulative_profit'], mode='lines',
-                             name=f'Base Only (Stop Spend)', 
-                             line=dict(color='#2ca02c', width=3, dash='dot'))) # Green dot
+    if not base_only_data_plot.empty:
+        fig.add_trace(go.Scatter(x=base_only_data_plot['date'], y=base_only_data_plot['cumulative_profit'], mode='lines',
+                                 name=f'Base Only (Stop Spend)', 
+                                 line=dict(color='#2ca02c', width=3, dash='dot'))) # Green dot
 
     # 4. Recovery line
-    # Mở rộng đường Recovery đến cuối trục x của dữ liệu dự báo được vẽ
     fig.add_shape(type="line", x0=df_history_plot['date'].min(), y0=recovery_threshold, x1=overall_max_plot_ds, y1=recovery_threshold,
                   line=dict(color="Red", width=2, dash="dot"), name=f'Recovery Threshold ({recovery_target_percent}%)')
     # 5. Breakeven Markers
-    if breakeven_ts:
+    if breakeven_ts is not None:
         fig.add_trace(go.Scatter(x=[breakeven_ts], y=[recovery_threshold], mode='markers',
                                  name=f'Est. Recovery (Optimized)', 
                                  marker=dict(size=12, color='Blue', symbol='circle')))
     
-    if base_only_breakeven_ts:
+    if base_only_breakeven_ts is not None:
         fig.add_trace(go.Scatter(x=[base_only_breakeven_ts], y=[recovery_threshold], mode='markers',
                                  name=f'Est. Recovery (Base Only)', 
                                  marker=dict(size=12, color='Green', symbol='star')))
@@ -576,6 +613,7 @@ with tab1:
                              'x': 0.5, 'xanchor': 'center'},
                       xaxis_title="Date", yaxis_title="Cumulative Profit ($)", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
+
 # ------------------ TAB 2: DAILY COST & REVENUE CHART ------------------
 with tab2:
     # Historical
@@ -583,40 +621,54 @@ with tab2:
     df_daily_hist = df_daily_hist.rename(columns={'revenue': 'total_revenue'})
 
     # Forecast (Optimized)
-    df_daily_forecast_opt = forecast_data_plot[['date', 'cost_f', 'total_revenue_f']].copy()
+    df_daily_forecast_opt = forecast_data_plot[['date', 'cost_f', 'total_revenue_f']].copy() if not forecast_data_plot.empty else pd.DataFrame(columns=['date','cost_f','total_revenue_f'])
     df_daily_forecast_opt = df_daily_forecast_opt.rename(columns={'cost_f': 'cost_opt', 'total_revenue_f': 'total_revenue_opt'})
 
     # Forecast (Base Only)
-    df_daily_forecast_base = base_only_data_plot[['date', 'cost_f', 'total_revenue_f']].copy()
+    df_daily_forecast_base = base_only_data_plot[['date', 'cost_f', 'total_revenue_f']].copy() if not base_only_data_plot.empty else pd.DataFrame(columns=['date','cost_f','total_revenue_f'])
     df_daily_forecast_base = df_daily_forecast_base.rename(columns={'cost_f': 'cost_base', 'total_revenue_f': 'total_revenue_base'})
 
     # ✅ Fix dtype mismatch before comparison
     last_actual_date = pd.to_datetime(df_daily_hist['date'].max())
-    df_daily_forecast_opt['date'] = pd.to_datetime(df_daily_forecast_opt['date'])
-    df_daily_forecast_base['date'] = pd.to_datetime(df_daily_forecast_base['date'])
+    if not df_daily_forecast_opt.empty:
+        df_daily_forecast_opt['date'] = pd.to_datetime(df_daily_forecast_opt['date'])
+    if not df_daily_forecast_base.empty:
+        df_daily_forecast_base['date'] = pd.to_datetime(df_daily_forecast_base['date'])
 
     # Filter forecast to show only after last actual date
-    df_daily_forecast_opt = df_daily_forecast_opt[df_daily_forecast_opt['date'] > last_actual_date]
-    df_daily_forecast_base = df_daily_forecast_base[df_daily_forecast_base['date'] > last_actual_date]
-
+    if not df_daily_forecast_opt.empty:
+        df_daily_forecast_opt = df_daily_forecast_opt[df_daily_forecast_opt['date'] > last_actual_date]
+    if not df_daily_forecast_base.empty:
+        df_daily_forecast_base = df_daily_forecast_base[df_daily_forecast_base['date'] > last_actual_date]
 
     # Combine Cost
     combined_cost = pd.concat([
         df_daily_hist[['date', 'cost']].set_index('date').rename(columns={'cost': 'historical_cost'}),
-        df_daily_forecast_opt[['date', 'cost_opt']].set_index('date'),
-        df_daily_forecast_base[['date', 'cost_base']].set_index('date')
+        df_daily_forecast_opt[['date', 'cost_opt']].set_index('date') if not df_daily_forecast_opt.empty else pd.DataFrame(),
+        df_daily_forecast_base[['date', 'cost_base']].set_index('date') if not df_daily_forecast_base.empty else pd.DataFrame()
     ], axis=1).reset_index()
 
     # Combine Revenue
     combined_rev = pd.concat([
         df_daily_hist[['date', 'total_revenue']].set_index('date').rename(columns={'total_revenue': 'historical_revenue'}),
-        df_daily_forecast_opt[['date', 'total_revenue_opt']].set_index('date'),
-        df_daily_forecast_base[['date', 'total_revenue_base']].set_index('date')
+        df_daily_forecast_opt[['date', 'total_revenue_opt']].set_index('date') if not df_daily_forecast_opt.empty else pd.DataFrame(),
+        df_daily_forecast_base[['date', 'total_revenue_base']].set_index('date') if not df_daily_forecast_base.empty else pd.DataFrame()
     ], axis=1).reset_index()
 
     # Fill missing values only where needed
-    combined_cost[['cost_opt', 'cost_base']] = combined_cost[['cost_opt', 'cost_base']].fillna(0)
-    combined_rev[['total_revenue_opt', 'total_revenue_base']] = combined_rev[['total_revenue_opt', 'total_revenue_base']].fillna(0)
+    if 'cost_opt' in combined_cost.columns and 'cost_base' in combined_cost.columns:
+        combined_cost[['cost_opt', 'cost_base']] = combined_cost[['cost_opt', 'cost_base']].fillna(0)
+    elif 'cost_opt' in combined_cost.columns:
+        combined_cost[['cost_opt']] = combined_cost[['cost_opt']].fillna(0)
+    elif 'cost_base' in combined_cost.columns:
+        combined_cost[['cost_base']] = combined_cost[['cost_base']].fillna(0)
+
+    if 'total_revenue_opt' in combined_rev.columns and 'total_revenue_base' in combined_rev.columns:
+        combined_rev[['total_revenue_opt', 'total_revenue_base']] = combined_rev[['total_revenue_opt', 'total_revenue_base']].fillna(0)
+    elif 'total_revenue_opt' in combined_rev.columns:
+        combined_rev[['total_revenue_opt']] = combined_rev[['total_revenue_opt']].fillna(0)
+    elif 'total_revenue_base' in combined_rev.columns:
+        combined_rev[['total_revenue_base']] = combined_rev[['total_revenue_base']].fillna(0)
 
     # --- PLOT ---
     fig_cr = go.Figure()
@@ -632,20 +684,23 @@ with tab2:
     ))
 
     # 2) Optimized Forecast
-    fig_cr.add_trace(go.Scatter(
-        x=combined_cost['date'], y=combined_cost['cost_opt'],
-        mode='lines', name='Forecasted Cost (Optimized)', line=dict(color='#2ECC71', width=3, dash='dash')
-    ))
-    fig_cr.add_trace(go.Scatter(
-        x=combined_rev['date'], y=combined_rev['total_revenue_opt'],
-        mode='lines', name='Forecasted Revenue (Optimized)', line=dict(color='#3498DB', width=3, dash='dash')
-    ))
+    if 'cost_opt' in combined_cost.columns:
+        fig_cr.add_trace(go.Scatter(
+            x=combined_cost['date'], y=combined_cost['cost_opt'],
+            mode='lines', name='Forecasted Cost (Optimized)', line=dict(color='#2ECC71', width=3, dash='dash')
+        ))
+    if 'total_revenue_opt' in combined_rev.columns:
+        fig_cr.add_trace(go.Scatter(
+            x=combined_rev['date'], y=combined_rev['total_revenue_opt'],
+            mode='lines', name='Forecasted Revenue (Optimized)', line=dict(color='#3498DB', width=3, dash='dash')
+        ))
 
     # 3) Base Only Forecast
-    fig_cr.add_trace(go.Scatter(
-        x=combined_rev['date'], y=combined_rev['total_revenue_base'],
-        mode='lines', name='Revenue (Base Only)', line=dict(color='darkorange', width=3, dash='dot')
-    ))
+    if 'total_revenue_base' in combined_rev.columns:
+        fig_cr.add_trace(go.Scatter(
+            x=combined_rev['date'], y=combined_rev['total_revenue_base'],
+            mode='lines', name='Revenue (Base Only)', line=dict(color='darkorange', width=3, dash='dot')
+        ))
 
     # --- Vertical Lines ---
     # End of History
@@ -657,7 +712,7 @@ with tab2:
     )
 
     # Optimized Breakeven
-    if breakeven_ts:
+    if breakeven_ts is not None:
         be_dt = breakeven_ts.to_pydatetime()
         fig_cr.add_shape(type="line", x0=be_dt, x1=be_dt, y0=0, y1=1, xref="x", yref="paper",
             line=dict(color="blue", width=2, dash="dash"))
@@ -666,7 +721,7 @@ with tab2:
             showarrow=False, font=dict(size=12, color="blue"))
 
     # Base-Only Breakeven
-    if base_only_breakeven_ts:
+    if base_only_breakeven_ts is not None:
         be_dt_base = base_only_breakeven_ts.to_pydatetime()
         fig_cr.add_shape(type="line", x0=be_dt_base, x1=be_dt_base, y0=0, y1=1, xref="x", yref="paper",
             line=dict(color="green", width=2, dash="dot"))
