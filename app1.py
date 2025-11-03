@@ -170,13 +170,11 @@ if df_all_daily.empty or df_renewal_raw.empty:
 # st.caption("Cached once daily for performance. Prophet + Renewal auto-refresh every 24h (via GitHub Action or ?refresh=1).")
 st.caption("Dashboard auto-refresh every 24h")
 
-# ==============================
-# RESTORE prepare_app_data()
-# ==============================
 @st.cache_data(ttl=86400, show_spinner="Processing App Data and Models...")
 def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     """
     Loads, filters, processes data, and runs Prophet/Renewal models for the selected app.
+    Detects abnormal zero-spend patterns to disable forecast when needed.
     """
     df = df_all_data[df_all_data['app_id'] == selected_app_id].sort_values('date').reset_index(drop=True)
     if df.empty:
@@ -190,6 +188,7 @@ def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     last_history_date = df['date'].iloc[-1]
     cost_hist_last = df['cost'].iloc[-1] 
 
+    # --- 7-Day Rolling ---
     df_7_days = df.tail(7)
     roas_baseline = df_7_days['revenue'].sum() / df_7_days['cost'].sum() if df_7_days['cost'].sum() > 0 else 1.0
     if np.isnan(roas_baseline) or np.isinf(roas_baseline):
@@ -198,16 +197,33 @@ def prepare_app_data(df_all_data, df_renewal_raw, selected_app_id):
     roas_hist_last = df['roas'].iloc[-1] if not df['roas'].iloc[-1] < 0.01 else roas_baseline
     roas_hist_last = roas_hist_last if not np.isnan(roas_hist_last) else roas_baseline
 
+    # --- Detect abnormal zero-spend pattern ---
+    zero_spend_days = (df_7_days['cost'] <= 0).sum()
+    disable_forecast = zero_spend_days > 2
+    if disable_forecast:
+        st.warning(f"⚠️ Detected {zero_spend_days} zero-spend days in last 7 days — disabling acquisition forecast.")
+
+    # --- Prepare forecast models ---
     df_history_prophet_input = df[['date', 'cost']].copy() 
     df_renewal_f = get_renewal_forecast_data(df_renewal_raw, selected_app_id)
-    df_propensity = get_prophet_cost_forecast(df_history_prophet_input) 
 
-    default_cost_day_1 = df_propensity['cost_prophet_f'].iloc[0] if not df_propensity.empty and df_propensity['cost_prophet_f'].iloc[0] > 0 else 1000
+    # Prophet cost forecast
+    df_propensity = pd.DataFrame()
+    if not disable_forecast:
+        df_propensity = get_prophet_cost_forecast(df_history_prophet_input) 
+
+    # Default Day 1 Cost
+    default_cost_day_1 = (
+        df_propensity['cost_prophet_f'].iloc[0]
+        if not df_propensity.empty and df_propensity['cost_prophet_f'].iloc[0] > 0
+        else 1000
+    )
 
     return (
-        df, current_loss, last_history_date, cost_hist_last, roas_hist_last, 
-        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days
+        df, current_loss, last_history_date, cost_hist_last, roas_hist_last,
+        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days, disable_forecast
     )
+
 # --- SIDEBAR: CONFIGURATION AND INPUTS (ENGLISH UI) ---
 
 with st.sidebar:
@@ -227,8 +243,9 @@ with st.sidebar:
 
     try:
         (df, current_loss, last_history_date, cost_hist_last, roas_hist_last, 
-        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days) = \
+        df_propensity, df_renewal_f, roas_baseline, default_cost_day_1, df_7_days, disable_forecast) = \
             prepare_app_data(df_all_daily, df_renewal_raw, selected_app_id)
+
     except ValueError as e:
         st.error(f"Data Preparation Error: {str(e)}")
         st.stop()
@@ -356,6 +373,11 @@ forecast_data = pd.DataFrame()
 forecast_period_data = pd.DataFrame()
 
 # -------------------- 1. RUN OPTIMIZED FORECAST --------------------
+if disable_forecast:
+    st.info("📉 Forecast disabled due to irregular spending pattern (too many zero-cost days). Showing only renewal baseline (Stop Spend).")
+    forecast_data = pd.DataFrame()
+    is_error_case = True
+    error_msg = "Forecast disabled due to zero-cost days."
 
 if df_propensity.empty:
     st.error("Error: Cost Prophet model failed. Calculation stopped.")
